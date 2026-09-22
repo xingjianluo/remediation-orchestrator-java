@@ -37,3 +37,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### Remediation orchestrator runtime data ###
+data/

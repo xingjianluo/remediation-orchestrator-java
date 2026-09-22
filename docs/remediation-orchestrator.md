@@ -1,0 +1,237 @@
+# 告警修复编排（Remediation Orchestrator）
+
+一套完全本地化的告警修复编排能力：按告警内容匹配修复策略并生成修复任务，
+在**重复告警、维护窗口、人工审批、执行失败与进程重启**等情况下，让修复动作的
+最终结果仍然**可预期、可追溯**。不接入任何外部服务，不使用真实凭据。
+
+- 运行形态：Spring Boot 内嵌 Web，本地文件持久化（JSON / JSONL）。
+- 本地动作：仅向本地文件追加标记、空操作、可控失败/慢动作，便于断言与演示。
+- 依赖：仅使用仓库已有依赖（Spring Web、Jackson、SLF4J、JUnit 5）。
+
+---
+
+## 1. 总体流程
+
+```
+HTTP 告警 ──▶ TaskEngine.accept
+                │
+                ├─ 1. 策略匹配（关键字 + 最低严重级别，按序取第一条启用策略）
+                │      └─ 无命中 → REJECTED_NO_POLICY（审计，不建任务）
+                ├─ 2. 维护窗口判定（目标精确匹配或 "*"，左闭右开区间）
+                │      └─ 命中 → SUPPRESSED_MAINTENANCE（审计，不建任务，无副作用）
+                ├─ 3. 去重指纹 = sha256(policyId | target | 规范化正文) 前 16 位
+                │      └─ 存在同指纹未终结任务 → DUPLICATE（返回既有任务 ID 与原因）
+                └─ 4. 创建任务
+                       ├─ 策略需审批 → WAITING_APPROVAL（ApprovalService 登记截止时间）
+                       └─ 否则 → QUEUED
+
+TaskDispatcher（定时扫描 + 固定大小线程池）
+   ├─ 审批超时扫描（WAITING_APPROVAL 超过截止 → APPROVAL_TIMEOUT 终态）
+   ├─ 取 QUEUED / 到期的 RETRY_WAIT 任务：
+   │     · 全局在跑任务数 < max-concurrent，否则保持排队（不丢弃）
+   │     · 同一 target 同时只有一个任务在跑（串行）
+   ├─ 逐步执行：已 SUCCEEDED 的步骤跳过（重启后也不会重跑）
+   │     · 失败且仍有重试额度 → RETRY_WAIT + nextAttemptAt，线性退避 base*n
+   │     · 超过重试额度 → FAILED（终态原因含步骤、尝试次数、底层错误）
+   │     · 步骤超时/取消 → 中断工作线程
+   └─ 全部步骤成功 → SUCCEEDED
+```
+
+受理结论 `DispositionCode`（被抑制/合并/拒绝原因彼此可区分）：
+
+| 结论 | 含义 | 是否建任务 |
+|---|---|---|
+| `CREATED` | 新建修复任务（可能立即排队，也可能等待审批） | 是 |
+| `DUPLICATE` | 等价告警已存在未终结任务，返回既有任务 ID 与当前状态 | 否（合并） |
+| `SUPPRESSED_MAINTENANCE` | 目标处于维护窗口，抑制且无任何修复副作用 | 否 |
+| `REJECTED_NO_POLICY` | 无启用策略命中（含策略被禁用） | 否 |
+
+---
+
+## 2. 状态模型
+
+### 2.1 任务状态 `TaskState`
+
+| 状态 | 含义 | 后继 |
+|---|---|---|
+| `QUEUED` | 已受理，等待调度槽位/审批放行 | `RUNNING` / `WAITING_APPROVAL`(仅创建时) / `CANCELLED` |
+| `WAITING_APPROVAL` | 高风险动作等待人工审批 | `QUEUED`(批准) / `APPROVAL_REJECTED` / `APPROVAL_TIMEOUT` / `CANCELLED` |
+| `RUNNING` | 有步骤正在执行 | `RETRY_WAIT` / `SUCCEEDED` / `FAILED` / `CANCELLED` |
+| `RETRY_WAIT` | 步骤失败后退避中，`nextAttemptAt` 到期可再调度 | `RUNNING` / `CANCELLED` |
+| `SUCCEEDED` | 终态：全部步骤成功 | — |
+| `FAILED` | 终态：步骤重试耗尽（含超时） | — |
+| `APPROVAL_REJECTED` | 终态：审批被拒绝 | — |
+| `APPROVAL_TIMEOUT` | 终态：审批超时（停机期间超时也会在恢复时落此态） | — |
+| `CANCELLED` | 终态：人工主动取消（审批中/排队中/运行中均可取消） | — |
+
+### 2.2 审批状态 `ApprovalStatus`
+
+`NONE → PENDING → APPROVED | REJECTED | TIMED_OUT | CANCELLED`
+
+四种结局**彼此可区分**，且分别对应任务的不同终态/后继：
+批准可继续执行；拒绝、超时为终态；取消伴随任务 `CANCELLED`。
+
+### 2.3 步骤状态 `StepState`
+
+`PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED`（另有 `SKIPPED` 保留）。
+取消时所有未成功步骤收束为 `CANCELLED`，系统中不存在“停在 RUNNING 的步骤 + 已终结任务”
+这种不自洽组合（唯一例外：进程被杀死，此时任务整体保持 `RUNNING` 等待恢复，见第 4 节）。
+
+### 2.4 自洽性保证
+
+- 每次状态迁移都遵循“**先写任务 JSON（临时文件 + 原子 rename），再追加审计 JSONL**”，
+  审计只增不改；任意终态都可在任务记录与审计流中找到对应事件。
+- 失败终态原因格式：
+  `step <i> (<name>) failed after <n> attempts: <最后一次底层错误>`，
+  同时保留每个步骤的 `attempts` / `lastError`，足以定位原因。
+
+---
+
+## 3. 策略模型
+
+策略位于 `src/main/resources/policies.json`（也可用文件路径覆盖，见配置项），
+按数组顺序匹配**第一条**启用策略：
+
+```json
+{
+  "id": "disk-full-cleanup",
+  "matchAnyKeywords": ["disk full", "磁盘满"],
+  "minSeverity": "WARN",
+  "requiresApproval": false,
+  "approvalTimeoutSeconds": 3600,
+  "maxRetries": 2,
+  "backoffBaseMillis": 50,
+  "stepTimeoutMillis": 2000,
+  "enabled": true,
+  "steps": [
+    { "type": "MARKER", "name": "mark", "params": { "message": "cleanup-started" } }
+  ]
+}
+```
+
+- `matchAnyKeywords`：告警正文（大小写不敏感）包含任一关键字即命中；**空数组表示通配**。
+- `minSeverity`：`INFO < WARN < CRITICAL`，为空表示不限制。
+- 重试次数/退避/步骤超时/审批超时均可按策略覆盖，留默认值（-1/0）则取全局配置。
+
+内置的纯本地步骤类型：
+
+| 类型 | 参数 | 行为 |
+|---|---|---|
+| `MARKER` | `message` | 向 `<data-dir>/markers/<target>.log` 追加一行，副作用可观测 |
+| `NOOP` | — | 恒成功 |
+| `FLAKY` | `failFirst`（默认 2） | 按“任务+步骤”在本地计数，前 n 次失败之后成功，用于验证重试 |
+| `ALWAYS_FAIL` | `message` | 恒失败，用于验证失败终态与信息留存 |
+| `SLOW` | `sleepMillis` | 睡眠，响应中断，用于验证步骤超时/取消/关停 |
+
+---
+
+## 4. 恢复语义（崩溃与重启）
+
+调度器作为 Spring `SmartLifecycle` 启动，**先恢复扫描再开始调度**：
+
+| 重启前状态 | 恢复动作 |
+|---|---|
+| `QUEUED` | 继续排队 |
+| `RUNNING` | 崩溃时在跑的步骤若处于 RUNNING 则重置为 PENDING，任务回到 QUEUED；**已经 SUCCEEDED 的步骤原样保留，绝不重新执行** |
+| `RETRY_WAIT` | 回到 QUEUED（退避重新计时），已持久化的 attempts 不丢 |
+| `WAITING_APPROVAL` | 审批是外部决策，继续等待；若截止时间已过则落 `APPROVAL_TIMEOUT` |
+| 任何终态 | 完全不触碰 |
+
+- 持久化：`tasks/<task-id>.json`（原子写）+ `audit.jsonl`（只追加），
+  因此“任务状态”和“审计结论”在重启后仍然自洽。
+- 优雅关停时中断工作线程：任务保持非终结状态落库，下次启动按上表恢复；
+  不会在关停路径写入任何虚假终态。
+- 幂等边界：步骤在 SUCCEEDED 之后才产生对外可观测副作用（如 MARKER 追加成功），
+  崩溃的当前步骤整体重跑；`RecoveryTest` 用 marker 文件行数证明已完成步骤不重复。
+
+---
+
+## 5. 可配置项
+
+前缀 `remediation.orchestrator`（`application.properties`，均可用环境变量/命令行覆盖）：
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `data-dir` | `data/remediation` | 任务 JSON、审计 JSONL、marker、维护窗口文件的根目录 |
+| `max-concurrent` | `4` | 全局同时执行的任务数上限；超出的任务排队而非丢弃 |
+| `default-max-retries` | `2` | 默认步骤最大重试次数（不含首次执行） |
+| `default-backoff-base-millis` | `200` | 线性退避基数，第 n 次重试等待 `base*n` 毫秒 |
+| `default-step-timeout-millis` | `5000` | 单步骤超时；超时中断执行线程并按失败处理 |
+| `default-approval-timeout-seconds` | `60` | 默认审批超时 |
+| `tick-millis` | `50` | 调度扫描间隔 |
+| `policies-location` | `classpath:policies.json` | 策略文件，支持 classpath: 与本地路径 |
+| `maintenance-file` | `<data-dir>/maintenance.json` | 维护窗口持久化文件 |
+
+运行时还可通过 HTTP API 增删维护窗口（立即持久化）。
+
+---
+
+## 6. HTTP API（本地，无鉴权/无外部依赖）
+
+| 方法与路径 | 说明 |
+|---|---|
+| `POST /api/alerts` | 提交告警，返回 disposition/taskId/reason |
+| `POST /api/tasks/{id}/approve` | 批准审批，body `{"approver":"..."}` |
+| `POST /api/tasks/{id}/reject` | 拒绝审批，body `{"approver":"...","reason":"..."}` |
+| `POST /api/tasks/{id}/cancel` | 主动取消（审批中/排队中/运行中均可） |
+| `GET  /api/tasks/{id}` | 查询任务完整状态（含步骤、尝试次数、错误） |
+| `GET  /api/tasks` | 列出全部任务 |
+| `GET  /api/audit?taskId=` | 查询审计事件（不带参为全部，JSONL 同源回读） |
+| `GET/POST/DELETE /api/maintenance[/{id}]` | 维护窗口查询/新增/删除 |
+
+审批已决定/任务已终结时再次决策返回 `409`；任务不存在返回 `404`。
+
+---
+
+## 7. 本地验证方法
+
+无需任何外部服务或凭据，JDK 21+ 与 Maven 即可。
+
+### 7.1 运行全部测试（25 个用例）
+
+```bash
+mvn test
+```
+
+覆盖场景与对应用例：
+
+| 场景 | 测试类 |
+|---|---|
+| 策略匹配与判定依据 | `PolicyMatcherTest` |
+| 重复/等价告警去重、无策略拒绝 | `DuplicateAlertTest` |
+| 维护窗口抑制（含通配窗口、文件持久化重载） | `MaintenanceWindowTest` |
+| 同目标串行、超全局上限排队不丢弃 | `ConcurrencyTest` |
+| 审批拦截：未批不执行、批准/拒绝/超时/取消四态区分 | `ApprovalTest` |
+| 运行中/排队中取消，无半完成状态 | `CancelRunningTest` |
+| 重试上限与退避、恒失败终态、步骤超时中断 | `RetryAndFailureTest` |
+| 重启恢复、已完成步骤不重跑、停机期间审批超时 | `RecoveryTest` |
+| HTTP 全链路（受理→去重→审批→成功→审计；窗口抑制） | `EndToEndIntegrationTest` |
+
+单测日志会打印**输入、判定依据与关键状态迁移**，例如
+`[accept] input ...`、`[match] ... basis: ...`、`[run] task=... step=... attempt=...`、
+`[recovery] ... completed steps preserved: ...`。
+
+### 7.2 启动应用并手工验证
+
+```bash
+mvn spring-boot:run
+# 或
+mvn package -DskipTests && java -jar target/remediation-orchestrator-java-1.0-SNAPSHOT.jar
+
+# 1) 高危告警（默认策略 restart-risky-service 需要审批）
+curl -s -X POST localhost:8080/api/alerts -H 'Content-Type: application/json' \
+  -d '{"id":"a1","target":"db-1","content":"need restart","severity":"CRITICAL"}'
+# 2) 批准后观察任务完成
+curl -s -X POST localhost:8080/api/tasks/<taskId>/approve \
+  -H 'Content-Type: application/json' -d '{"approver":"oncall"}'
+curl -s localhost:8080/api/tasks/<taskId>
+# 3) 审计链
+curl -s "localhost:8080/api/audit?taskId=<taskId>"
+```
+
+运行后可在 `data/remediation/` 下检查：
+
+- `tasks/*.json`：任务与步骤的最终状态；
+- `audit.jsonl`：每行一个审计事件；
+- `markers/<target>.log`：MARKER 动作的本地副作用证据；
+- `maintenance.json`：维护窗口。

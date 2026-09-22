@@ -1,0 +1,39 @@
+[
+  {
+    "id": "disk-full-cleanup",
+    "description": "磁盘满：本地标记 + 可失败步骤演示重试",
+    "matchAnyKeywords": ["disk full", "磁盘满", "disk"],
+    "minSeverity": "WARN",
+    "requiresApproval": false,
+    "maxRetries": 2,
+    "backoffBaseMillis": 50,
+    "stepTimeoutMillis": 2000,
+    "steps": [
+      { "type": "MARKER", "name": "mark-disk-alert", "params": { "message": "cleanup-started" } },
+      { "type": "NOOP", "name": "simulate-cleanup" }
+    ]
+  },
+  {
+    "id": "restart-risky-service",
+    "description": "高风险：重启核心服务需要人工审批",
+    "matchAnyKeywords": ["restart", "重启"],
+    "minSeverity": "CRITICAL",
+    "requiresApproval": true,
+    "approvalTimeoutSeconds": 3600,
+    "maxRetries": 1,
+    "backoffBaseMillis": 50,
+    "stepTimeoutMillis": 2000,
+    "steps": [
+      { "type": "MARKER", "name": "mark-restart", "params": { "message": "service-restarted" } }
+    ]
+  },
+  {
+    "id": "default-noop",
+    "description": "兜底策略：未命中其它关键字时仅记录标记",
+    "matchAnyKeywords": [],
+    "requiresApproval": false,
+    "steps": [
+      { "type": "NOOP", "name": "acknowledge" }
+    ]
+  }
+]
