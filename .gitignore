@@ -4,6 +4,10 @@ target/
 !**/src/test/**/target/
 .kotlin
 
+### Local runtime data (task snapshots + audit log) and run logs ###
+/data/
+/app-run*.log
+
 ### IntelliJ IDEA ###
 .idea/modules.xml
 .idea/jarRepositories.xml
