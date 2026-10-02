@@ -21,6 +21,13 @@ HTTP 告警 ──▶ TaskEngine.accept
                 │      └─ 命中 → SUPPRESSED_MAINTENANCE（审计，不建任务，无副作用）
                 ├─ 3. 去重指纹 = sha256(policyId | target | 规范化正文) 前 16 位
                 │      └─ 存在同指纹未终结任务 → DUPLICATE（返回既有任务 ID 与原因）
+                ├─ 3.5 复发判定：同指纹最近任务已终结（见第 5 节）
+                │      ├─ 人工放弃期内 → RECURRENCE_ABANDONED
+                │      ├─ 有待消费的人工确认 → 消费并放行一次新任务（CREATED）
+                │      ├─ 统计窗内复发次数 ≥ 阈值 → RECURRENCE_ESCALATED
+                │      ├─ 前次成功且抑制窗口内 → RECURRENCE_SUPPRESSED
+                │      ├─ 前次成功且窗口已过 → 放行一次新任务（CREATED）
+                │      └─ 前次未成功 → RECURRENCE_AFTER_FAILURE
                 └─ 4. 创建任务
                        ├─ 策略需审批 → WAITING_APPROVAL（ApprovalService 登记截止时间）
                        └─ 否则 → QUEUED
@@ -41,10 +48,14 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
 
 | 结论 | 含义 | 是否建任务 |
 |---|---|---|
-| `CREATED` | 新建修复任务（可能立即排队，也可能等待审批） | 是 |
+| `CREATED` | 新建修复任务（可能立即排队，也可能等待审批；含复发被放行/确认后重开） | 是 |
 | `DUPLICATE` | 等价告警已存在未终结任务，返回既有任务 ID 与当前状态 | 否（合并） |
 | `SUPPRESSED_MAINTENANCE` | 目标处于维护窗口，抑制且无任何修复副作用 | 否 |
 | `REJECTED_NO_POLICY` | 无启用策略命中（含策略被禁用） | 否 |
+| `RECURRENCE_SUPPRESSED` | 前次修复成功后，复发处于抑制窗口内 | 否 |
+| `RECURRENCE_ESCALATED` | 统计窗内复发次数达阈值，升级为需人工确认 | 否 |
+| `RECURRENCE_AFTER_FAILURE` | 前次修复未成功（失败/取消/审批拒绝/超时），复发需人工确认 | 否 |
+| `RECURRENCE_ABANDONED` | 人工已放弃该目标本次修复，统计窗内不再自动修复 | 否 |
 
 ---
 
@@ -137,8 +148,10 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
 | `WAITING_APPROVAL` | 审批是外部决策，继续等待；若截止时间已过则落 `APPROVAL_TIMEOUT` |
 | 任何终态 | 完全不触碰 |
 
-- 持久化：`tasks/<task-id>.json`（原子写）+ `audit.jsonl`（只追加），
-  因此“任务状态”和“审计结论”在重启后仍然自洽。
+- 持久化：`tasks/<task-id>.json`（原子写）+ `audit.jsonl`（只追加）+
+  `recurrence.json`（复发事件与确认/放弃标记，原子写），
+  因此“任务状态”“审计结论”和“复发计数”在重启后仍然自洽；
+  停在 `QUEUED`/`RETRY_WAIT` 的修复不会被复发判定误当成已结束。
 - 优雅关停时中断工作线程：任务保持非终结状态落库，下次启动按上表恢复；
   不会在关停路径写入任何虚假终态。
 - 幂等边界：步骤在 SUCCEEDED 之后才产生对外可观测副作用（如 MARKER 追加成功），
@@ -146,7 +159,51 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
 
 ---
 
-## 5. 可配置项
+## 5. 复发与升级（Recurrence & Escalation）
+
+同一个目标、同类问题、内容等价的告警（同去重指纹）在**前次修复已经终结**之后再次到达时，
+不再当作全新修复处理，而是进入复发路径。三种情形可明确区分：
+
+| 情形 | 判定依据 | 结论 |
+|---|---|---|
+| 修复还在进行中的重复 | 同指纹存在未终结任务 | `DUPLICATE`（合并，不新增） |
+| 刚修好又复发 | 同指纹最近终态任务为 `SUCCEEDED` | 抑制窗口内 `RECURRENCE_SUPPRESSED`；窗口过后放行一次新任务（`CREATED`） |
+| 之前修复失败后又来一次 | 同指纹最近终态任务为 `FAILED`/`CANCELLED`/审批拒绝/审批超时 | `RECURRENCE_AFTER_FAILURE`（需人工确认） |
+
+### 5.1 抑制窗口（recurrence-suppression-window-millis）
+
+- 前次修复**成功终结**后，窗口内的复发一律不新增修复动作（`RECURRENCE_SUPPRESSED`）；
+- 窗口届满（`now - finishedAt >= 窗口`，边界为左闭右开）**最多放行一次**新修复；
+- 重开出来的任务走正常 `QUEUED` → 调度流程，**仍受同目标串行与全局并发上限约束**；
+  该任务未终结前，后续等价告警按 `DUPLICATE` 合并；它终结后抑制窗口从其 `finishedAt` 重新起算，
+  因此告警持续推送也不会把执行资源打满。
+
+### 5.2 升级（统计窗 + 复发阈值）
+
+- 每次复发（前次修复终结后的等价告警）都会按**目标**记录一条复发事件并持久化；
+- 统计窗（`recurrence-stats-window-millis`）内事件数 ≥ `recurrence-escalation-threshold`
+  即升级为 `RECURRENCE_ESCALATED`：人工确认之前**不得自动执行任何修复、无任何副作用**；
+- 升级是**派生状态**：窗口滑动后旧事件过期、计数回落，升级自然解除，不会永久卡死；
+- 人工确认（`POST /api/recurrence/{target}/confirm`）：清除已累计事件，
+  下一次复发放行**一次**真实修复（消费确认后复位；绕过抑制窗口与失败后拦截，因为人工已明确表态）；
+- 人工放弃（`POST /api/recurrence/{target}/abandon`）：清除已累计事件，
+  之后一个统计窗内该目标的复发一律 `RECURRENCE_ABANDONED`，窗口滑过后恢复常规判定；
+- 升级状态、当前复发次数与所依据的时间窗可通过
+  `GET /api/recurrence/{target}`（或 `GET /api/recurrence` 全量）查询。
+
+### 5.3 与既有语义的兼容边界
+
+- **去重**：未终结任务（含 `QUEUED`/`RETRY_WAIT`/`RUNNING`/`WAITING_APPROVAL`）优先命中
+  `DUPLICATE`，复发判定只针对“同指纹任务已全部终结”的情形；
+- **维护窗口**：窗口判定在复发判定之前，命中窗口的告警既不计复发事件也不建任务；
+- **审批**：复发被放行/确认后重开的任务，若策略要求审批仍进入 `WAITING_APPROVAL`，语义不变；
+- **恢复**：复发事件、确认/放弃标记持久化在 `<data-dir>/recurrence.json`（原子写），
+  重启后计数不清零；“前次修复结果”直接从任务存储派生，因此停在
+  `QUEUED`/`RETRY_WAIT` 的未完成修复不会被误判为已结束，重启后仍按原安排恢复推进。
+
+---
+
+## 6. 可配置项
 
 前缀 `remediation.orchestrator`（`application.properties`，均可用环境变量/命令行覆盖）：
 
@@ -161,12 +218,15 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
 | `tick-millis` | `50` | 调度扫描间隔 |
 | `policies-location` | `classpath:policies.json` | 策略文件，支持 classpath: 与本地路径 |
 | `maintenance-file` | `<data-dir>/maintenance.json` | 维护窗口持久化文件 |
+| `recurrence-suppression-window-millis` | `300000` | 复发抑制窗口：前次修复成功后该窗口内的复发不新增修复动作 |
+| `recurrence-stats-window-millis` | `3600000` | 复发统计时间窗（滑动）：升级判定与放弃期的依据 |
+| `recurrence-escalation-threshold` | `3` | 统计窗内复发次数达到该阈值即升级为需人工确认 |
 
 运行时还可通过 HTTP API 增删维护窗口（立即持久化）。
 
 ---
 
-## 6. HTTP API（本地，无鉴权/无外部依赖）
+## 7. HTTP API（本地，无鉴权/无外部依赖）
 
 | 方法与路径 | 说明 |
 |---|---|
@@ -178,16 +238,20 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
 | `GET  /api/tasks` | 列出全部任务 |
 | `GET  /api/audit?taskId=` | 查询审计事件（不带参为全部，JSONL 同源回读） |
 | `GET/POST/DELETE /api/maintenance[/{id}]` | 维护窗口查询/新增/删除 |
+| `GET  /api/recurrence` | 全部目标的复发/升级状态（计数、时间窗、确认/放弃标记） |
+| `GET  /api/recurrence/{target}` | 单个目标的复发/升级状态 |
+| `POST /api/recurrence/{target}/confirm` | 人工确认：放行该目标下一次复发的一次真实修复 |
+| `POST /api/recurrence/{target}/abandon` | 人工放弃：统计窗内该目标复发不再自动修复 |
 
 审批已决定/任务已终结时再次决策返回 `409`；任务不存在返回 `404`。
 
 ---
 
-## 7. 本地验证方法
+## 8. 本地验证方法
 
 无需任何外部服务或凭据，JDK 21+ 与 Maven 即可。
 
-### 7.1 运行全部测试（25 个用例）
+### 8.1 运行全部测试（32 个用例）
 
 ```bash
 mvn test
@@ -205,13 +269,14 @@ mvn test
 | 运行中/排队中取消，无半完成状态 | `CancelRunningTest` |
 | 重试上限与退避、恒失败终态、步骤超时中断 | `RetryAndFailureTest` |
 | 重启恢复、已完成步骤不重跑、停机期间审批超时 | `RecoveryTest` |
+| 复发抑制/受控重开、窗口边界、升级与确认、放弃、重启后复发连续性 | `RecurrenceTest` |
 | HTTP 全链路（受理→去重→审批→成功→审计；窗口抑制） | `EndToEndIntegrationTest` |
 
 单测日志会打印**输入、判定依据与关键状态迁移**，例如
 `[accept] input ...`、`[match] ... basis: ...`、`[run] task=... step=... attempt=...`、
 `[recovery] ... completed steps preserved: ...`。
 
-### 7.2 启动应用并手工验证
+### 8.2 启动应用并手工验证
 
 ```bash
 mvn spring-boot:run
@@ -227,6 +292,15 @@ curl -s -X POST localhost:8080/api/tasks/<taskId>/approve \
 curl -s localhost:8080/api/tasks/<taskId>
 # 3) 审计链
 curl -s "localhost:8080/api/audit?taskId=<taskId>"
+
+# 4) 复发场景：同一告警在修复成功后 5 分钟（默认抑制窗）内再次推送
+curl -s -X POST localhost:8080/api/alerts -H 'Content-Type: application/json' \
+  -d '{"id":"a2","target":"db-1","content":"need restart","severity":"CRITICAL"}'
+#    → RECURRENCE_SUPPRESSED / RECURRENCE_ESCALATED 等，不新增任务
+# 5) 查看目标复发状态，人工确认后再推送即放行一次新修复
+curl -s localhost:8080/api/recurrence/db-1
+curl -s -X POST localhost:8080/api/recurrence/db-1/confirm \
+  -H 'Content-Type: application/json' -d '{"approver":"oncall"}'
 ```
 
 运行后可在 `data/remediation/` 下检查：
@@ -234,4 +308,5 @@ curl -s "localhost:8080/api/audit?taskId=<taskId>"
 - `tasks/*.json`：任务与步骤的最终状态；
 - `audit.jsonl`：每行一个审计事件；
 - `markers/<target>.log`：MARKER 动作的本地副作用证据；
-- `maintenance.json`：维护窗口。
+- `maintenance.json`：维护窗口；
+- `recurrence.json`：各目标复发事件时间戳与人工确认/放弃标记。

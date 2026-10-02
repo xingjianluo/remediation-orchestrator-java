@@ -38,6 +38,13 @@ public class InMemoryTaskStore implements TaskStore {
     }
 
     @Override
+    public synchronized List<RemediationTask> findByFingerprint(String fingerprint) {
+        return tasks.values().stream()
+                .filter(t -> fingerprint.equals(t.fingerprint))
+                .map(InMemoryTaskStore::copy).toList();
+    }
+
+    @Override
     public synchronized List<RemediationTask> findAll() {
         return tasks.values().stream().map(InMemoryTaskStore::copy).toList();
     }

@@ -24,6 +24,12 @@ public class OrchestratorProperties {
     private String policiesLocation = "classpath:policies.json";
     /** 维护窗口配置文件，为空时仅使用 dataDir 下的文件与运行时 API。 */
     private String maintenanceFile = "";
+    /** 复发抑制窗口毫秒：前次修复终结后该窗口内的复发不新增修复动作。 */
+    private long recurrenceSuppressionWindowMillis = 300_000;
+    /** 复发统计时间窗毫秒：用于升级判定的滑动窗口。 */
+    private long recurrenceStatsWindowMillis = 3_600_000;
+    /** 统计窗内复发次数达到该阈值即升级为需人工确认。 */
+    private int recurrenceEscalationThreshold = 3;
 
     public String getDataDir() { return dataDir; }
     public void setDataDir(String dataDir) { this.dataDir = dataDir; }
@@ -43,4 +49,10 @@ public class OrchestratorProperties {
     public void setPoliciesLocation(String policiesLocation) { this.policiesLocation = policiesLocation; }
     public String getMaintenanceFile() { return maintenanceFile; }
     public void setMaintenanceFile(String maintenanceFile) { this.maintenanceFile = maintenanceFile; }
+    public long getRecurrenceSuppressionWindowMillis() { return recurrenceSuppressionWindowMillis; }
+    public void setRecurrenceSuppressionWindowMillis(long v) { this.recurrenceSuppressionWindowMillis = v; }
+    public long getRecurrenceStatsWindowMillis() { return recurrenceStatsWindowMillis; }
+    public void setRecurrenceStatsWindowMillis(long v) { this.recurrenceStatsWindowMillis = v; }
+    public int getRecurrenceEscalationThreshold() { return recurrenceEscalationThreshold; }
+    public void setRecurrenceEscalationThreshold(int v) { this.recurrenceEscalationThreshold = v; }
 }

@@ -9,6 +9,8 @@ import com.github.xingjianluo.remediationorchestratorjava.model.Alert;
 import com.github.xingjianluo.remediationorchestratorjava.model.AuditEvent;
 import com.github.xingjianluo.remediationorchestratorjava.model.DispositionCode;
 import com.github.xingjianluo.remediationorchestratorjava.model.RemediationTask;
+import com.github.xingjianluo.remediationorchestratorjava.recurrence.RecurrenceService;
+import com.github.xingjianluo.remediationorchestratorjava.recurrence.RecurrenceStatus;
 import com.github.xingjianluo.remediationorchestratorjava.store.AuditLog;
 import com.github.xingjianluo.remediationorchestratorjava.store.TaskStore;
 import org.slf4j.Logger;
@@ -40,16 +42,18 @@ public class OrchestratorController {
     private final AuditLog auditLog;
     private final ApprovalService approvalService;
     private final MaintenanceWindowService maintenance;
+    private final RecurrenceService recurrenceService;
     private final Clock clock;
 
     public OrchestratorController(TaskEngine engine, TaskStore taskStore, AuditLog auditLog,
                                   ApprovalService approvalService, MaintenanceWindowService maintenance,
-                                  Clock clock) {
+                                  RecurrenceService recurrenceService, Clock clock) {
         this.engine = engine;
         this.taskStore = taskStore;
         this.auditLog = auditLog;
         this.approvalService = approvalService;
         this.maintenance = maintenance;
+        this.recurrenceService = recurrenceService;
         this.clock = clock;
     }
 
@@ -126,6 +130,33 @@ public class OrchestratorController {
     public ResponseEntity<Map<String, Object>> removeMaintenance(@PathVariable String id) {
         boolean removed = maintenance.removeWindow(id);
         return ResponseEntity.ok(Map.of("removed", removed));
+    }
+
+    /** 查询全部目标的复发/升级状态（含当前复发计数与所依据的时间窗）。 */
+    @GetMapping("/recurrence")
+    public List<RecurrenceStatus> listRecurrence() {
+        return recurrenceService.allStatus();
+    }
+
+    @GetMapping("/recurrence/{target}")
+    public ResponseEntity<RecurrenceStatus> getRecurrence(@PathVariable String target) {
+        return ResponseEntity.ok(recurrenceService.status(target));
+    }
+
+    /** 人工确认：放行该目标下一次复发的一次真实修复。 */
+    @PostMapping("/recurrence/{target}/confirm")
+    public RecurrenceStatus confirmRecurrence(@PathVariable String target,
+                                              @RequestBody(required = false) ApiDtos.DecisionRequest req) {
+        recurrenceService.confirm(target, req == null ? "" : req.approver());
+        return recurrenceService.status(target);
+    }
+
+    /** 人工放弃：统计窗内该目标的复发不再自动修复。 */
+    @PostMapping("/recurrence/{target}/abandon")
+    public RecurrenceStatus abandonRecurrence(@PathVariable String target,
+                                              @RequestBody(required = false) ApiDtos.DecisionRequest req) {
+        recurrenceService.abandon(target, req == null ? "" : req.approver(), req == null ? "" : req.reason());
+        return recurrenceService.status(target);
     }
 
     private ResponseEntity<Map<String, Object>> decisionResponse(boolean ok, String taskId) {

@@ -11,9 +11,11 @@ import com.github.xingjianluo.remediationorchestratorjava.executor.LocalStepHand
 import com.github.xingjianluo.remediationorchestratorjava.executor.StepExecutor;
 import com.github.xingjianluo.remediationorchestratorjava.maintenance.MaintenanceWindowService;
 import com.github.xingjianluo.remediationorchestratorjava.model.*;
+import com.github.xingjianluo.remediationorchestratorjava.recurrence.RecurrenceService;
 import com.github.xingjianluo.remediationorchestratorjava.store.AuditLog;
 import com.github.xingjianluo.remediationorchestratorjava.store.FileAuditLog;
 import com.github.xingjianluo.remediationorchestratorjava.store.FileTaskStore;
+import com.github.xingjianluo.remediationorchestratorjava.store.InMemoryRecurrenceStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
@@ -61,8 +63,10 @@ class RecoveryTest {
     private TaskDispatcher newDispatcher(Stack s, List<RemediationPolicy> policies, Clock clock) {
         MaintenanceWindowService mw = new MaintenanceWindowService();
         ApprovalService approvals = new ApprovalService(s.store, s.audit, s.props, clock);
+        RecurrenceService recurrence = new RecurrenceService(
+                new InMemoryRecurrenceStore(), s.audit, s.props, clock);
         TaskEngine engine = new TaskEngine(s.store, s.audit, new PolicyMatcher(policies),
-                mw, s.props, clock);
+                mw, s.props, clock, recurrence);
         engine.setApprovalService(approvals);
         StepExecutor executor = new StepExecutor(LocalStepHandlers.defaults(tempDir));
         RecoveryService recovery = new RecoveryService(s.store, s.audit, clock);

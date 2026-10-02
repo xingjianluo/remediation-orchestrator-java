@@ -18,7 +18,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * 使用独立临时数据目录，不依赖任何外部服务。
  */
 @SpringBootTest(properties = {
-        "remediation.orchestrator.data-dir=target/e2e-data",
+        "remediation.orchestrator.data-dir=target/e2e-data-${random.uuid}",
         "remediation.orchestrator.tick-millis=30",
         "remediation.orchestrator.default-backoff-base-millis=20",
         "remediation.orchestrator.default-step-timeout-millis=2000",

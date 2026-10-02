@@ -4,6 +4,7 @@ import com.github.xingjianluo.remediationorchestratorjava.approval.ApprovalServi
 import com.github.xingjianluo.remediationorchestratorjava.config.OrchestratorProperties;
 import com.github.xingjianluo.remediationorchestratorjava.maintenance.MaintenanceWindowService;
 import com.github.xingjianluo.remediationorchestratorjava.model.*;
+import com.github.xingjianluo.remediationorchestratorjava.recurrence.RecurrenceService;
 import com.github.xingjianluo.remediationorchestratorjava.store.AuditLog;
 import com.github.xingjianluo.remediationorchestratorjava.store.TaskStore;
 import org.slf4j.Logger;
@@ -40,16 +41,19 @@ public class TaskEngine {
     private final MaintenanceWindowService maintenance;
     private final OrchestratorProperties props;
     private final Clock clock;
+    private final RecurrenceService recurrenceService;
     private ApprovalService approvalService;
 
     public TaskEngine(TaskStore taskStore, AuditLog auditLog, PolicyMatcher matcher,
-                      MaintenanceWindowService maintenance, OrchestratorProperties props, Clock clock) {
+                      MaintenanceWindowService maintenance, OrchestratorProperties props, Clock clock,
+                      RecurrenceService recurrenceService) {
         this.taskStore = taskStore;
         this.auditLog = auditLog;
         this.matcher = matcher;
         this.maintenance = maintenance;
         this.props = props;
         this.clock = clock;
+        this.recurrenceService = recurrenceService;
     }
 
     public void setApprovalService(ApprovalService approvalService) {
@@ -96,34 +100,133 @@ public class TaskEngine {
             return new AcceptResult(DispositionCode.DUPLICATE, existing.id, reason);
         }
 
+        RemediationTask previous = latestTerminalByFingerprint(fingerprint);
+        if (previous != null) {
+            return handleRecurrence(alert, policy, matched.get(), fingerprint, previous, now);
+        }
+
+        return createTask(alert, policy, matched.get(), fingerprint, now, Map.of());
+    }
+
+    /**
+     * 复发路径：同指纹任务已终结后等价告警再次到达。处理顺序：
+     * <ol>
+     *   <li>记录复发事件（持久化，驱动升级判定）；</li>
+     *   <li>人工放弃期内 → RECURRENCE_ABANDONED；</li>
+     *   <li>有待消费的人工确认 → 消费并放行一次真实修复（CREATED）；</li>
+     *   <li>统计窗内复发次数达阈值 → RECURRENCE_ESCALATED（需人工确认，无任何副作用）；</li>
+     *   <li>前次修复成功：抑制窗口内 → RECURRENCE_SUPPRESSED；窗口过后 → 放行一次新修复（CREATED）；</li>
+     *   <li>前次修复未成功（FAILED/CANCELLED/审批拒绝/审批超时）→ RECURRENCE_AFTER_FAILURE（需人工确认）。</li>
+     * </ol>
+     * 放行的修复走正常 QUEUED 流程，仍受同目标串行与全局并发上限约束。
+     */
+    private AcceptResult handleRecurrence(Alert alert, RemediationPolicy policy,
+                                          PolicyMatcher.MatchedPolicy matched, String fingerprint,
+                                          RemediationTask previous, long now) {
+        int count = recurrenceService.recordRecurrence(alert.target());
+        Map<String, Object> base = new HashMap<>(Map.of(
+                "fingerprint", fingerprint,
+                "previousTaskId", previous.id,
+                "previousState", previous.state.name(),
+                "recurrenceCount", count,
+                "escalationThreshold", props.getRecurrenceEscalationThreshold(),
+                "statsWindowMillis", props.getRecurrenceStatsWindowMillis(),
+                "suppressionWindowMillis", props.getRecurrenceSuppressionWindowMillis()));
+
+        if (recurrenceService.isAbandoned(alert.target())) {
+            String reason = "target " + alert.target() + " abandoned by operator; no auto-remediation within stats window";
+            audit(alert, AuditEvents.ALERT_RECURRENCE_ABANDONED, previous.id, withReason(base, reason));
+            log.info("[accept] RECURRENCE_ABANDONED alertId={} target={}", alert.id(), alert.target());
+            return new AcceptResult(DispositionCode.RECURRENCE_ABANDONED, previous.id, reason);
+        }
+
+        if (recurrenceService.hasConfirmation(alert.target())) {
+            recurrenceService.consumeConfirmation(alert.target());
+            String reason = "recurrence confirmed by operator; reopening remediation after task "
+                    + previous.id + " (" + previous.state + ")";
+            AcceptResult result = createTask(alert, policy, matched, fingerprint, now,
+                    Map.of("reopen", "operator-confirmed", "previousTaskId", previous.id));
+            log.info("[accept] RECURRENCE confirmed-reopen alertId={} task={}", alert.id(), result.taskId());
+            return result;
+        }
+
+        if (count >= props.getRecurrenceEscalationThreshold()) {
+            String reason = "recurrence count " + count + " reached threshold "
+                    + props.getRecurrenceEscalationThreshold() + " within stats window "
+                    + props.getRecurrenceStatsWindowMillis() + "ms; manual confirmation required";
+            audit(alert, AuditEvents.ALERT_RECURRENCE_ESCALATED, previous.id, withReason(base, reason));
+            log.info("[accept] RECURRENCE_ESCALATED alertId={} target={} count={}",
+                    alert.id(), alert.target(), count);
+            return new AcceptResult(DispositionCode.RECURRENCE_ESCALATED, previous.id, reason);
+        }
+
+        if (previous.state == TaskState.SUCCEEDED) {
+            long elapsed = now - previous.finishedAt;
+            if (elapsed < props.getRecurrenceSuppressionWindowMillis()) {
+                String reason = "recurrence within suppression window (" + elapsed + "ms elapsed of "
+                        + props.getRecurrenceSuppressionWindowMillis() + "ms) after succeeded task " + previous.id;
+                audit(alert, AuditEvents.ALERT_RECURRENCE_SUPPRESSED, previous.id, withReason(base, reason));
+                log.info("[accept] RECURRENCE_SUPPRESSED alertId={} elapsed={}ms", alert.id(), elapsed);
+                return new AcceptResult(DispositionCode.RECURRENCE_SUPPRESSED, previous.id, reason);
+            }
+            String reason = "suppression window elapsed after succeeded task " + previous.id
+                    + "; reopening remediation (recurrence #" + count + ")";
+            AcceptResult result = createTask(alert, policy, matched, fingerprint, now,
+                    Map.of("reopen", "suppression-window-elapsed", "previousTaskId", previous.id));
+            log.info("[accept] RECURRENCE reopen alertId={} task={} prev={}",
+                    alert.id(), result.taskId(), previous.id);
+            return result;
+        }
+
+        String reason = "previous task " + previous.id + " ended " + previous.state
+                + "; equivalent alert requires manual confirmation before retry";
+        audit(alert, AuditEvents.ALERT_RECURRENCE_AFTER_FAILURE, previous.id, withReason(base, reason));
+        log.info("[accept] RECURRENCE_AFTER_FAILURE alertId={} prev={} state={}",
+                alert.id(), previous.id, previous.state);
+        return new AcceptResult(DispositionCode.RECURRENCE_AFTER_FAILURE, previous.id, reason);
+    }
+
+    /** 同指纹最近的终态任务（复发判定的基准），无则返回 null。 */
+    private RemediationTask latestTerminalByFingerprint(String fingerprint) {
+        return taskStore.findByFingerprint(fingerprint).stream()
+                .filter(t -> t.state.isTerminal())
+                .max(java.util.Comparator.comparingLong(t -> t.finishedAt))
+                .orElse(null);
+    }
+
+    private AcceptResult createTask(Alert alert, RemediationPolicy policy, PolicyMatcher.MatchedPolicy matched,
+                                    String fingerprint, long now, Map<String, Object> extraAudit) {
         RemediationTask task = newTask(alert, policy, fingerprint, now);
+        Map<String, Object> detail = new HashMap<>(Map.of(
+                "policyId", policy.id,
+                "matchBasis", matched.reason(),
+                "fingerprint", fingerprint));
+        detail.putAll(extraAudit);
         if (policy.requiresApproval) {
             if (approvalService == null) {
                 throw new IllegalStateException("ApprovalService not wired but policy " + policy.id + " requires approval");
             }
             approvalService.request(task, policy.approvalTimeoutSeconds);
-            audit(alert, AuditEvents.ALERT_ACCEPTED, task.id, Map.of(
-                    "policyId", policy.id,
-                    "matchBasis", matched.get().reason(),
-                    "fingerprint", fingerprint,
-                    "state", TaskState.WAITING_APPROVAL.name()));
+            detail.put("state", TaskState.WAITING_APPROVAL.name());
+            audit(alert, AuditEvents.ALERT_ACCEPTED, task.id, detail);
             log.info("[accept] CREATED (awaiting approval) alertId={} task={} policy={}",
                     alert.id(), task.id, policy.id);
         } else {
             taskStore.save(task);
-            audit(alert, AuditEvents.TASK_QUEUED, task.id, Map.of(
-                    "policyId", policy.id,
-                    "matchBasis", matched.get().reason(),
-                    "fingerprint", fingerprint,
-                    "state", TaskState.QUEUED.name()));
+            detail.put("state", TaskState.QUEUED.name());
+            audit(alert, AuditEvents.TASK_QUEUED, task.id, detail);
             audit(alert, AuditEvents.ALERT_ACCEPTED, task.id, Map.of(
                     "policyId", policy.id,
                     "state", TaskState.QUEUED.name()));
+            if (!extraAudit.isEmpty()) {
+                audit(alert, AuditEvents.ALERT_RECURRENCE_REOPENED, task.id, detail);
+            }
             log.info("[accept] CREATED alertId={} task={} policy={} target={}",
                     alert.id(), task.id, policy.id, alert.target());
         }
         return new AcceptResult(DispositionCode.CREATED, task.id,
-                "policy=" + policy.id + ", fingerprint=" + fingerprint);
+                "policy=" + policy.id + ", fingerprint=" + fingerprint
+                        + (extraAudit.isEmpty() ? "" : ", " + extraAudit.get("reopen")));
     }
 
     /**
@@ -231,6 +334,12 @@ public class TaskEngine {
         all.putIfAbsent("alertId", alert.id());
         all.putIfAbsent("target", alert.target());
         auditLog.append(new AuditEvent(clock.millis(), event, taskId, alert.id(), all));
+    }
+
+    private static Map<String, Object> withReason(Map<String, Object> base, String reason) {
+        Map<String, Object> all = new HashMap<>(base);
+        all.put("reason", reason);
+        return all;
     }
 
     private static String safe(String s) {

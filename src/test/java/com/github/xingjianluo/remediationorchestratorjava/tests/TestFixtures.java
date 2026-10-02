@@ -12,9 +12,12 @@ import com.github.xingjianluo.remediationorchestratorjava.maintenance.Maintenanc
 import com.github.xingjianluo.remediationorchestratorjava.model.RemediationPolicy;
 import com.github.xingjianluo.remediationorchestratorjava.model.StepSpec;
 import com.github.xingjianluo.remediationorchestratorjava.model.StepType;
+import com.github.xingjianluo.remediationorchestratorjava.recurrence.RecurrenceService;
 import com.github.xingjianluo.remediationorchestratorjava.store.AuditLog;
 import com.github.xingjianluo.remediationorchestratorjava.store.InMemoryAuditLog;
+import com.github.xingjianluo.remediationorchestratorjava.store.InMemoryRecurrenceStore;
 import com.github.xingjianluo.remediationorchestratorjava.store.InMemoryTaskStore;
+import com.github.xingjianluo.remediationorchestratorjava.store.RecurrenceStore;
 import com.github.xingjianluo.remediationorchestratorjava.store.TaskStore;
 
 import java.nio.file.Path;
@@ -65,6 +68,8 @@ final class TestFixtures {
         OrchestratorProperties props;
         TaskStore store;
         AuditLog audit;
+        RecurrenceStore recurrenceStore;
+        RecurrenceService recurrence;
         MaintenanceWindowService maintenance;
         ApprovalService approvals;
         TaskEngine engine;
@@ -99,13 +104,18 @@ final class TestFixtures {
         env.props.setDefaultBackoffBaseMillis(20);
         env.props.setDefaultStepTimeoutMillis(1000);
         env.props.setDefaultApprovalTimeoutSeconds(60);
+        env.props.setRecurrenceSuppressionWindowMillis(1_000);
+        env.props.setRecurrenceStatsWindowMillis(5_000);
+        env.props.setRecurrenceEscalationThreshold(3);
         env.store = new InMemoryTaskStore();
         env.audit = new InMemoryAuditLog();
         env.clock = new MutableClock(startTime);
         env.maintenance = new MaintenanceWindowService();
+        env.recurrenceStore = new InMemoryRecurrenceStore();
+        env.recurrence = new RecurrenceService(env.recurrenceStore, env.audit, env.props, env.clock);
         env.approvals = new ApprovalService(env.store, env.audit, env.props, env.clock);
         env.engine = new TaskEngine(env.store, env.audit, new PolicyMatcher(policies),
-                env.maintenance, env.props, env.clock);
+                env.maintenance, env.props, env.clock, env.recurrence);
         env.engine.setApprovalService(env.approvals);
         env.stepExecutor = new StepExecutor(LocalStepHandlers.defaults(dataDir));
         env.recovery = new RecoveryService(env.store, env.audit, env.clock);
