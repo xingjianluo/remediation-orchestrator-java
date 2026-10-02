@@ -40,16 +40,19 @@ public class TaskEngine {
     private final MaintenanceWindowService maintenance;
     private final OrchestratorProperties props;
     private final Clock clock;
+    private final RecurrenceService recurrenceService;
     private ApprovalService approvalService;
 
     public TaskEngine(TaskStore taskStore, AuditLog auditLog, PolicyMatcher matcher,
-                      MaintenanceWindowService maintenance, OrchestratorProperties props, Clock clock) {
+                      MaintenanceWindowService maintenance, OrchestratorProperties props, Clock clock,
+                      RecurrenceService recurrenceService) {
         this.taskStore = taskStore;
         this.auditLog = auditLog;
         this.matcher = matcher;
         this.maintenance = maintenance;
         this.props = props;
         this.clock = clock;
+        this.recurrenceService = recurrenceService;
     }
 
     public void setApprovalService(ApprovalService approvalService) {
@@ -96,6 +99,31 @@ public class TaskEngine {
             return new AcceptResult(DispositionCode.DUPLICATE, existing.id, reason);
         }
 
+        // 复发判定：仅当同指纹存在已终结任务时介入；未终结任务已在上面按 DUPLICATE 合并。
+        RecurrenceService.Assessment recurrence = recurrenceService.assess(fingerprint, now);
+        switch (recurrence.verdict()) {
+            case SUPPRESS -> {
+                audit(alert, AuditEvents.ALERT_RECURRENCE_SUPPRESSED, null, recurrenceDetail(fingerprint, recurrence));
+                log.info("[accept] RECURRENCE_SUPPRESSED alertId={} {}", alert.id(), recurrence.reason());
+                return new AcceptResult(DispositionCode.RECURRENCE_SUPPRESSED, null, recurrence.reason());
+            }
+            case ESCALATE -> {
+                audit(alert, AuditEvents.ALERT_RECURRENCE_ESCALATED, null, recurrenceDetail(fingerprint, recurrence));
+                log.info("[accept] RECURRENCE_ESCALATED alertId={} {}", alert.id(), recurrence.reason());
+                return new AcceptResult(DispositionCode.RECURRENCE_ESCALATED, null,
+                        recurrence.reason() + "; fingerprint=" + fingerprint);
+            }
+            case ABANDONED -> {
+                audit(alert, AuditEvents.ALERT_RECURRENCE_ABANDONED, null, recurrenceDetail(fingerprint, recurrence));
+                log.info("[accept] RECURRENCE_ABANDONED alertId={} {}", alert.id(), recurrence.reason());
+                return new AcceptResult(DispositionCode.RECURRENCE_ABANDONED, null, recurrence.reason());
+            }
+            default -> {
+                // NOT_RECURRENCE / REOPEN：继续创建任务
+            }
+        }
+        boolean reopened = recurrence.verdict() == RecurrenceService.Verdict.REOPEN;
+
         RemediationTask task = newTask(alert, policy, fingerprint, now);
         if (policy.requiresApproval) {
             if (approvalService == null) {
@@ -122,8 +150,26 @@ public class TaskEngine {
             log.info("[accept] CREATED alertId={} task={} policy={} target={}",
                     alert.id(), task.id, policy.id, alert.target());
         }
+        if (reopened) {
+            audit(alert, AuditEvents.ALERT_RECURRENCE_REOPENED, task.id, recurrenceDetail(fingerprint, recurrence));
+            log.info("[accept] RECURRENCE_REOPENED alertId={} task={} {}", alert.id(), task.id, recurrence.reason());
+            return new AcceptResult(DispositionCode.RECURRENCE_REOPENED, task.id, recurrence.reason());
+        }
         return new AcceptResult(DispositionCode.CREATED, task.id,
                 "policy=" + policy.id + ", fingerprint=" + fingerprint);
+    }
+
+    private Map<String, Object> recurrenceDetail(String fingerprint, RecurrenceService.Assessment rec) {
+        Map<String, Object> detail = new HashMap<>();
+        detail.put("fingerprint", fingerprint);
+        detail.put("recurrenceCount", rec.recurrenceCount());
+        detail.put("threshold", rec.threshold());
+        detail.put("lastTerminalState", rec.lastTerminalState() == null ? "" : rec.lastTerminalState().name());
+        detail.put("lastFinishedAt", rec.lastFinishedAt());
+        detail.put("suppressedUntil", rec.suppressedUntil());
+        detail.put("decision", rec.decision().name());
+        detail.put("reason", rec.reason());
+        return detail;
     }
 
     /**

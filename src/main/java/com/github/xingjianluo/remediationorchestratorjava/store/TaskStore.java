@@ -16,6 +16,9 @@ public interface TaskStore {
     /** 按去重指纹查找未终结任务（重复告警判定）。 */
     Optional<RemediationTask> findOpenByFingerprint(String fingerprint);
 
+    /** 按去重指纹查找全部任务（含终态），供复发统计使用。 */
+    List<RemediationTask> findByFingerprint(String fingerprint);
+
     List<RemediationTask> findAll();
 
     List<RemediationTask> findByTarget(String target);

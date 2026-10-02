@@ -3,11 +3,13 @@ package com.github.xingjianluo.remediationorchestratorjava.api;
 import com.github.xingjianluo.remediationorchestratorjava.approval.ApprovalService;
 import com.github.xingjianluo.remediationorchestratorjava.config.MaintenanceWindow;
 import com.github.xingjianluo.remediationorchestratorjava.engine.TaskEngine;
+import com.github.xingjianluo.remediationorchestratorjava.engine.RecurrenceService;
 import com.github.xingjianluo.remediationorchestratorjava.maintenance.MaintenanceWindowService;
 import com.github.xingjianluo.remediationorchestratorjava.model.AcceptResult;
 import com.github.xingjianluo.remediationorchestratorjava.model.Alert;
 import com.github.xingjianluo.remediationorchestratorjava.model.AuditEvent;
 import com.github.xingjianluo.remediationorchestratorjava.model.DispositionCode;
+import com.github.xingjianluo.remediationorchestratorjava.model.EscalationDecision;
 import com.github.xingjianluo.remediationorchestratorjava.model.RemediationTask;
 import com.github.xingjianluo.remediationorchestratorjava.store.AuditLog;
 import com.github.xingjianluo.remediationorchestratorjava.store.TaskStore;
@@ -40,16 +42,18 @@ public class OrchestratorController {
     private final AuditLog auditLog;
     private final ApprovalService approvalService;
     private final MaintenanceWindowService maintenance;
+    private final RecurrenceService recurrenceService;
     private final Clock clock;
 
     public OrchestratorController(TaskEngine engine, TaskStore taskStore, AuditLog auditLog,
                                   ApprovalService approvalService, MaintenanceWindowService maintenance,
-                                  Clock clock) {
+                                  RecurrenceService recurrenceService, Clock clock) {
         this.engine = engine;
         this.taskStore = taskStore;
         this.auditLog = auditLog;
         this.approvalService = approvalService;
         this.maintenance = maintenance;
+        this.recurrenceService = recurrenceService;
         this.clock = clock;
     }
 
@@ -62,6 +66,7 @@ public class OrchestratorController {
                 req.severity() == null ? "WARN" : req.severity(), occurredAt);
         AcceptResult result = engine.accept(alert);
         HttpStatus status = result.disposition() == DispositionCode.CREATED
+                || result.disposition() == DispositionCode.RECURRENCE_REOPENED
                 ? HttpStatus.CREATED : HttpStatus.OK;
         return ResponseEntity.status(status).body(result);
     }
@@ -111,6 +116,34 @@ public class OrchestratorController {
     @GetMapping("/maintenance")
     public List<MaintenanceWindow> listMaintenance() {
         return maintenance.listWindows();
+    }
+
+    /** 复发状态查询：升级状态、当前复发计数与所依据的时间窗。 */
+    @GetMapping("/recurrence")
+    public List<RecurrenceService.RecurrenceStatus> recurrence(
+            @RequestParam(required = false) String target) {
+        long now = clock.millis();
+        return target == null || target.isBlank()
+                ? recurrenceService.statusAll(now)
+                : recurrenceService.statusForTarget(target, now);
+    }
+
+    /** 人工确认升级：放行该指纹的复发修复（计数再增长会重新升级）。 */
+    @PostMapping("/recurrence/{fingerprint}/confirm")
+    public EscalationDecision confirmRecurrence(@PathVariable String fingerprint,
+                                                @RequestBody(required = false) ApiDtos.DecisionRequest req) {
+        String operator = req == null ? "" : req.approver();
+        String note = req == null ? "" : req.reason();
+        return recurrenceService.confirm(fingerprint, operator, note, clock.millis());
+    }
+
+    /** 人工放弃：统计窗滑出阈值前不再自动修复该指纹的告警。 */
+    @PostMapping("/recurrence/{fingerprint}/abandon")
+    public EscalationDecision abandonRecurrence(@PathVariable String fingerprint,
+                                                @RequestBody(required = false) ApiDtos.DecisionRequest req) {
+        String operator = req == null ? "" : req.approver();
+        String note = req == null ? "" : req.reason();
+        return recurrenceService.abandon(fingerprint, operator, note, clock.millis());
     }
 
     @PostMapping("/maintenance")

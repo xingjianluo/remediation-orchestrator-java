@@ -216,7 +216,7 @@ public class TaskDispatcher implements SmartLifecycle {
             runningTargets.remove(extractTarget(taskId));
             active.decrementAndGet();
             if (interruptedByShutdown) {
-                log.info("[run] task={} left RUNNING for restart recovery", taskId);
+                log.info("[run] task={} left in persisted state for restart recovery", taskId);
             }
         }
     }
@@ -314,8 +314,15 @@ public class TaskDispatcher implements SmartLifecycle {
                         "backoffMillis", delay,
                         "nextAttemptAt", task.nextAttemptAt));
                 log.info("[run] task={} step={} retry {} in {}ms", task.id, step.index, attempt + 2, delay);
-                if (sleepBackoff(task.id, delay)) {
+                BackoffOutcome backoff = sleepBackoff(task.id, delay);
+                if (backoff == BackoffOutcome.CANCELLED) {
                     return StepOutcome.CANCELLED;
+                }
+                if (backoff == BackoffOutcome.SHUTDOWN) {
+                    // 关停打断退避：任务保持 RETRY_WAIT 落库，重启后由恢复器按原安排重排队。
+                    log.info("[run] task={} backoff interrupted by shutdown; stays RETRY_WAIT for recovery",
+                            task.id);
+                    return StepOutcome.INTERRUPTED;
                 }
                 task.state = TaskState.RUNNING;
                 task.nextAttemptAt = 0;
@@ -335,25 +342,32 @@ public class TaskDispatcher implements SmartLifecycle {
     /**
      * 退避等待。注意：线程睡眠基于真实墙钟时间，因此循环截止判定使用 System.currentTimeMillis()；
      * 持久化字段 nextAttemptAt 仍使用注入时钟，以保证重启恢复语义可测。
-     *
-     * @return true 表示退避期间收到取消请求或关停中断。
+     * 关停中断与取消请求严格区分：只有显式取消才返回 CANCELLED；
+     * 关停返回 SHUTDOWN，任务保持 RETRY_WAIT 落库，不写入任何终态。
      */
-    private boolean sleepBackoff(String taskId, long delayMillis) {
+    private BackoffOutcome sleepBackoff(String taskId, long delayMillis) {
         long deadline = System.currentTimeMillis() + delayMillis;
         while (true) {
             long remaining = deadline - System.currentTimeMillis();
             if (remaining <= 0) {
-                return false;
+                return BackoffOutcome.DONE;
             }
             try {
                 Thread.sleep(Math.min(50, remaining));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return true;
+                RemediationTask latest = taskStore.findById(taskId).orElse(null);
+                if (latest != null && latest.cancelRequested) {
+                    return BackoffOutcome.CANCELLED;
+                }
+                return BackoffOutcome.SHUTDOWN;
             }
             RemediationTask latest = taskStore.findById(taskId).orElse(null);
-            if (latest == null || latest.cancelRequested || !running) {
-                return true;
+            if (latest == null || latest.cancelRequested) {
+                return BackoffOutcome.CANCELLED;
+            }
+            if (!running) {
+                return BackoffOutcome.SHUTDOWN;
             }
         }
     }
@@ -419,5 +433,9 @@ public class TaskDispatcher implements SmartLifecycle {
 
     private enum StepOutcome {
         SUCCEEDED, FAILED, CANCELLED, INTERRUPTED
+    }
+
+    private enum BackoffOutcome {
+        DONE, CANCELLED, SHUTDOWN
     }
 }

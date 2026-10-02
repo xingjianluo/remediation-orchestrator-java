@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.xingjianluo.remediationorchestratorjava.approval.ApprovalService;
 import com.github.xingjianluo.remediationorchestratorjava.engine.PolicyMatcher;
 import com.github.xingjianluo.remediationorchestratorjava.engine.RecoveryService;
+import com.github.xingjianluo.remediationorchestratorjava.engine.RecurrenceService;
 import com.github.xingjianluo.remediationorchestratorjava.engine.TaskDispatcher;
 import com.github.xingjianluo.remediationorchestratorjava.engine.TaskEngine;
 import com.github.xingjianluo.remediationorchestratorjava.executor.LocalStepHandlers;
@@ -11,6 +12,7 @@ import com.github.xingjianluo.remediationorchestratorjava.executor.StepExecutor;
 import com.github.xingjianluo.remediationorchestratorjava.maintenance.MaintenanceWindowService;
 import com.github.xingjianluo.remediationorchestratorjava.model.RemediationPolicy;
 import com.github.xingjianluo.remediationorchestratorjava.store.AuditLog;
+import com.github.xingjianluo.remediationorchestratorjava.store.EscalationStore;
 import com.github.xingjianluo.remediationorchestratorjava.store.FileAuditLog;
 import com.github.xingjianluo.remediationorchestratorjava.store.FileTaskStore;
 import com.github.xingjianluo.remediationorchestratorjava.store.TaskStore;
@@ -83,10 +85,26 @@ public class OrchestratorConfig {
     }
 
     @Bean
+    public EscalationStore escalationStore(OrchestratorProperties props, ObjectMapper mapper) {
+        EscalationStore store = new EscalationStore(
+                Path.of(props.getDataDir(), "escalations.json"), mapper);
+        store.init();
+        return store;
+    }
+
+    @Bean
+    public RecurrenceService recurrenceService(TaskStore taskStore, EscalationStore escalationStore,
+                                               AuditLog auditLog, OrchestratorProperties props) {
+        return new RecurrenceService(taskStore, escalationStore, auditLog, props);
+    }
+
+    @Bean
     public TaskEngine taskEngine(TaskStore taskStore, AuditLog auditLog, PolicyMatcher matcher,
                                  MaintenanceWindowService maintenance, ApprovalService approvalService,
-                                 OrchestratorProperties props, Clock clock) {
-        TaskEngine engine = new TaskEngine(taskStore, auditLog, matcher, maintenance, props, clock);
+                                 OrchestratorProperties props, Clock clock,
+                                 RecurrenceService recurrenceService) {
+        TaskEngine engine = new TaskEngine(taskStore, auditLog, matcher, maintenance, props, clock,
+                recurrenceService);
         engine.setApprovalService(approvalService);
         return engine;
     }

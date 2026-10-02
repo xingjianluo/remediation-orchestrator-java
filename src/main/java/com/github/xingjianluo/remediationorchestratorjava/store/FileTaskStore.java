@@ -102,6 +102,18 @@ public class FileTaskStore implements TaskStore {
     }
 
     @Override
+    public List<RemediationTask> findByFingerprint(String fingerprint) {
+        lock.lock();
+        try {
+            return tasks.values().stream()
+                    .filter(t -> fingerprint.equals(t.fingerprint))
+                    .map(this::copy).toList();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
     public List<RemediationTask> findAll() {
         lock.lock();
         try {

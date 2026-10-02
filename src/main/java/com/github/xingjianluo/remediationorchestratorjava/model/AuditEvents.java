@@ -24,4 +24,10 @@ public final class AuditEvents {
     public static final String TASK_FAILED = "TASK_FAILED";
     public static final String RECOVERY_SCAN = "RECOVERY_SCAN";
     public static final String RECOVERY_RESUMED = "RECOVERY_RESUMED";
+    public static final String ALERT_RECURRENCE_SUPPRESSED = "ALERT_RECURRENCE_SUPPRESSED";
+    public static final String ALERT_RECURRENCE_REOPENED = "ALERT_RECURRENCE_REOPENED";
+    public static final String ALERT_RECURRENCE_ESCALATED = "ALERT_RECURRENCE_ESCALATED";
+    public static final String ALERT_RECURRENCE_ABANDONED = "ALERT_RECURRENCE_ABANDONED";
+    public static final String ESCALATION_CONFIRMED = "ESCALATION_CONFIRMED";
+    public static final String ESCALATION_ABANDONED = "ESCALATION_ABANDONED";
 }

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.xingjianluo.remediationorchestratorjava.config.OrchestratorProperties;
 import com.github.xingjianluo.remediationorchestratorjava.engine.PolicyMatcher;
 import com.github.xingjianluo.remediationorchestratorjava.engine.RecoveryService;
+import com.github.xingjianluo.remediationorchestratorjava.engine.RecurrenceService;
 import com.github.xingjianluo.remediationorchestratorjava.engine.TaskDispatcher;
 import com.github.xingjianluo.remediationorchestratorjava.engine.TaskEngine;
 import com.github.xingjianluo.remediationorchestratorjava.approval.ApprovalService;
@@ -12,6 +13,7 @@ import com.github.xingjianluo.remediationorchestratorjava.executor.StepExecutor;
 import com.github.xingjianluo.remediationorchestratorjava.maintenance.MaintenanceWindowService;
 import com.github.xingjianluo.remediationorchestratorjava.model.*;
 import com.github.xingjianluo.remediationorchestratorjava.store.AuditLog;
+import com.github.xingjianluo.remediationorchestratorjava.store.EscalationStore;
 import com.github.xingjianluo.remediationorchestratorjava.store.FileAuditLog;
 import com.github.xingjianluo.remediationorchestratorjava.store.FileTaskStore;
 import org.junit.jupiter.api.Test;
@@ -61,8 +63,10 @@ class RecoveryTest {
     private TaskDispatcher newDispatcher(Stack s, List<RemediationPolicy> policies, Clock clock) {
         MaintenanceWindowService mw = new MaintenanceWindowService();
         ApprovalService approvals = new ApprovalService(s.store, s.audit, s.props, clock);
+        RecurrenceService recurrence = new RecurrenceService(s.store,
+                new EscalationStore(tempDir.resolve("escalations.json"), s.mapper), s.audit, s.props);
         TaskEngine engine = new TaskEngine(s.store, s.audit, new PolicyMatcher(policies),
-                mw, s.props, clock);
+                mw, s.props, clock, recurrence);
         engine.setApprovalService(approvals);
         StepExecutor executor = new StepExecutor(LocalStepHandlers.defaults(tempDir));
         RecoveryService recovery = new RecoveryService(s.store, s.audit, clock);
