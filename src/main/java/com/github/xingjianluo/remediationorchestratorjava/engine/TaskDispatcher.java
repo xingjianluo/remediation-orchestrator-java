@@ -35,7 +35,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>同目标串行：维护运行中目标集合，同一目标同时只有一个任务在线程中；</li>
  *   <li>重试退避：失败后持久化 RETRY_WAIT + nextAttemptAt，线程内退避等待（崩溃后由恢复器重排队）；</li>
  *   <li>取消：每个步骤与退避等待前后检查 cancelRequested，取消时未做步骤置 CANCELLED，不留半完成态；</li>
- *   <li>关停：工作线程被中断时保留 RUNNING 落库状态，下次启动恢复，不写任何终态。</li>
+ *   <li>关停：工作线程被中断时保留 RUNNING/RETRY_WAIT 落库状态，下次启动恢复，不写任何终态；
+ *       关停与取消几乎同时发生时以存储中的 cancelRequested 为唯一判定依据（取消优先）。</li>
  * </ul>
  */
 public class TaskDispatcher implements SmartLifecycle {
@@ -216,7 +217,9 @@ public class TaskDispatcher implements SmartLifecycle {
             runningTargets.remove(extractTarget(taskId));
             active.decrementAndGet();
             if (interruptedByShutdown) {
-                log.info("[run] task={} left RUNNING for restart recovery", taskId);
+                // 关停路径不写库，此处读出的即为恢复器将看到的落库状态（RUNNING 或 RETRY_WAIT）
+                log.info("[run] task={} interrupted by shutdown; persisted state={} left for restart recovery",
+                        taskId, taskStore.findById(taskId).map(t -> t.state).orElse(null));
             }
         }
     }
@@ -232,7 +235,10 @@ public class TaskDispatcher implements SmartLifecycle {
         long timeout = task.stepTimeoutMillis >= 0 ? task.stepTimeoutMillis
                 : props.getDefaultStepTimeoutMillis();
 
-        int attempt = 0; // 0 = 首次执行；1..maxRetries 为重试
+        // 重启续跑：从已持久化的 attempts 继续，累计次数不清零、重试预算不重置。
+        // 崩溃/关停时被中断的那次尝试（步骤停在 RUNNING 被复位）可能 attempts > maxRetries，
+        // 用 min 把这次“未完成的尝试”让出来，保证已完成尝试数仍受 maxRetries 约束。
+        int attempt = Math.min(Math.max(0, step.attempts), maxRetries); // 0 = 首次执行；1..maxRetries 为重试
         while (attempt <= maxRetries) {
             RemediationTask fresh = taskStore.findById(task.id).orElseThrow();
             if (fresh.cancelRequested) {
@@ -287,13 +293,21 @@ public class TaskDispatcher implements SmartLifecycle {
                     task.id, step.index, attempt + 1, result.error());
 
             if (interrupt) {
-                if (cancelRequested) {
+                // 执行线程被中断只可能来自关停（主动取消不打断线程，只置 cancelRequested 标志）。
+                // 原子更新：仅当存储中没有取消结论时才把在跑步骤复位为 PENDING；
+                // 若取消几乎同时发生，则以存储中的 cancelRequested/终态为唯一结论（取消优先）。
+                final int stepIndex = step.index;
+                RemediationTask decided = taskStore.update(task.id, t -> {
+                    if (!t.cancelRequested && !t.state.isTerminal()) {
+                        t.steps.get(stepIndex).state = StepState.PENDING;
+                        t.updatedAt = clock.millis();
+                    }
+                    return t;
+                }).orElseThrow();
+                if (decided.cancelRequested || decided.state.isTerminal()) {
                     return StepOutcome.CANCELLED;
                 }
-                // 非取消的中断只可能来自关停：恢复步骤为 PENDING，保持任务 RUNNING 供重启恢复。
-                step.state = StepState.PENDING;
-                task.updatedAt = clock.millis();
-                taskStore.save(task);
+                // 纯关停：步骤已复位 PENDING，任务保持 RUNNING 落库，等重启恢复，不写任何终态。
                 return StepOutcome.INTERRUPTED;
             }
 
@@ -314,13 +328,29 @@ public class TaskDispatcher implements SmartLifecycle {
                         "backoffMillis", delay,
                         "nextAttemptAt", task.nextAttemptAt));
                 log.info("[run] task={} step={} retry {} in {}ms", task.id, step.index, attempt + 2, delay);
-                if (sleepBackoff(task.id, delay)) {
+                BackoffOutcome backoff = sleepBackoff(task.id, delay);
+                if (backoff == BackoffOutcome.CANCELLED) {
                     return StepOutcome.CANCELLED;
                 }
-                task.state = TaskState.RUNNING;
-                task.nextAttemptAt = 0;
-                task.updatedAt = clock.millis();
-                taskStore.save(task);
+                if (backoff == BackoffOutcome.SHUTDOWN) {
+                    // 关停打断退避：RETRY_WAIT + nextAttemptAt 已持久化，直接保持落库状态，
+                    // 不写任何终态，重启后由恢复器重新排队、按原安排继续重试。
+                    log.info("[run] task={} shutdown during backoff; stays RETRY_WAIT (nextAttemptAt={})",
+                            task.id, task.nextAttemptAt);
+                    return StepOutcome.INTERRUPTED;
+                }
+                // 退避到期恢复执行：原子更新，若等待期间收到取消则以取消为唯一结论
+                RemediationTask resumed = taskStore.update(task.id, t -> {
+                    if (!t.cancelRequested && !t.state.isTerminal()) {
+                        t.state = TaskState.RUNNING;
+                        t.nextAttemptAt = 0;
+                        t.updatedAt = clock.millis();
+                    }
+                    return t;
+                }).orElseThrow();
+                if (resumed.cancelRequested || resumed.state.isTerminal()) {
+                    return StepOutcome.CANCELLED;
+                }
             } else {
                 step.state = StepState.FAILED;
                 task.updatedAt = clock.millis();
@@ -335,27 +365,41 @@ public class TaskDispatcher implements SmartLifecycle {
     /**
      * 退避等待。注意：线程睡眠基于真实墙钟时间，因此循环截止判定使用 System.currentTimeMillis()；
      * 持久化字段 nextAttemptAt 仍使用注入时钟，以保证重启恢复语义可测。
-     *
-     * @return true 表示退避期间收到取消请求或关停中断。
+     * <p>
+     * 返回 {@link BackoffOutcome}，把“退避到期”“主动取消”“关停打断”三种结局区分开：
+     * 关停与取消几乎同时发生时，以存储中的 cancelRequested/终态为唯一判定依据（取消优先）。
      */
-    private boolean sleepBackoff(String taskId, long delayMillis) {
+    private BackoffOutcome sleepBackoff(String taskId, long delayMillis) {
         long deadline = System.currentTimeMillis() + delayMillis;
         while (true) {
             long remaining = deadline - System.currentTimeMillis();
             if (remaining <= 0) {
-                return false;
+                return BackoffOutcome.ELAPSED;
             }
             try {
                 Thread.sleep(Math.min(50, remaining));
             } catch (InterruptedException e) {
+                // 取消不打断工作线程，中断只可能来自关停；但仍以存储中的取消标志复核
                 Thread.currentThread().interrupt();
-                return true;
+                return shutdownOrCancel(taskId);
             }
             RemediationTask latest = taskStore.findById(taskId).orElse(null);
-            if (latest == null || latest.cancelRequested || !running) {
-                return true;
+            if (latest == null || latest.cancelRequested || latest.state.isTerminal()) {
+                return BackoffOutcome.CANCELLED;
+            }
+            if (!running) {
+                return shutdownOrCancel(taskId);
             }
         }
+    }
+
+    /** 关停被打断时的最终判定：存储里已有取消结论则取消优先，否则认定为关停打断。 */
+    private BackoffOutcome shutdownOrCancel(String taskId) {
+        RemediationTask latest = taskStore.findById(taskId).orElse(null);
+        if (latest == null || latest.cancelRequested || latest.state.isTerminal()) {
+            return BackoffOutcome.CANCELLED;
+        }
+        return BackoffOutcome.SHUTDOWN;
     }
 
     private void finishSucceeded(String taskId) {
@@ -419,5 +463,10 @@ public class TaskDispatcher implements SmartLifecycle {
 
     private enum StepOutcome {
         SUCCEEDED, FAILED, CANCELLED, INTERRUPTED
+    }
+
+    /** 退避等待的三种结局：到期继续、主动取消、关停打断（保持落库状态等重启恢复）。 */
+    private enum BackoffOutcome {
+        ELAPSED, CANCELLED, SHUTDOWN
     }
 }

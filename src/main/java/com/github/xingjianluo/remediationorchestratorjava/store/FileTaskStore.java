@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
 
 /**
@@ -60,6 +61,34 @@ public class FileTaskStore implements TaskStore {
         lock.lock();
         try {
             tasks.put(task.id, task);
+            persist(task);
+            return task;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public Optional<RemediationTask> update(String taskId, UnaryOperator<RemediationTask> mutator) {
+        lock.lock();
+        try {
+            RemediationTask current = tasks.get(taskId);
+            if (current == null) {
+                return Optional.empty();
+            }
+            // 直接改内存中的 canonical 实例并落盘，判定与写回都在锁内，杜绝读-改-写竞争
+            RemediationTask updated = mutator.apply(current);
+            tasks.put(updated.id, updated);
+            persist(updated);
+            return Optional.of(copy(updated));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 先写临时文件再原子移动；调用方必须持有 lock。 */
+    private void persist(RemediationTask task) {
+        try {
             Path target = dir.resolve(task.id + ".json");
             Path tmp = dir.resolve(task.id + ".json.tmp");
             String json = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(task);
@@ -69,11 +98,8 @@ public class FileTaskStore implements TaskStore {
             } catch (java.nio.file.AtomicMoveNotSupportedException e) {
                 Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
             }
-            return task;
         } catch (Exception e) {
             throw new IllegalStateException("Failed to persist task " + task.id, e);
-        } finally {
-            lock.unlock();
         }
     }
 

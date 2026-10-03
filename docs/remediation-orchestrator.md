@@ -146,7 +146,44 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
 | `RUNNING` | 崩溃时在跑的步骤若处于 RUNNING 则重置为 PENDING，任务回到 QUEUED；**已经 SUCCEEDED 的步骤原样保留，绝不重新执行** |
 | `RETRY_WAIT` | 回到 QUEUED（退避重新计时），已持久化的 attempts 不丢 |
 | `WAITING_APPROVAL` | 审批是外部决策，继续等待；若截止时间已过则落 `APPROVAL_TIMEOUT` |
+| 非终结 + `cancelRequested` | 关停前已受理的主动取消没来得及收尾：恢复器直接收尾为 `CANCELLED`（取消优先） |
 | 任何终态 | 完全不触碰 |
+
+### 4.1 关停恰好落在“等待重试 / 排队”期间
+
+优雅关停（`SmartLifecycle.stop`，非 `kill -9`）可能打断的不只是正在执行的步骤，
+也可能是**退避等待重试**（`RETRY_WAIT`）或**排队等槽位**（`QUEUED`）中的任务。
+这两类情形的语义与“执行中被打断”一致：
+
+- **关停路径不写任何终态**。退避等待被关停中断时，任务保持已持久化的
+  `RETRY_WAIT + nextAttemptAt`；排队中的任务本来就没有线程在跑，保持 `QUEUED`。
+  重启后恢复器把它们重新纳入调度：该重试的继续重试、该排队的继续排队，
+  最终正常走到 `SUCCEEDED` / `FAILED`。
+- **已累计的尝试次数不清零**：重试预算（`maxRetries`）按持久化的 `attempts`
+  跨重启连续计算，重启不会白送额外重试；被关停打断的那一次“未完成尝试”不占预算。
+- **已成功步骤不重跑**：只有 `SUCCEEDED` 的步骤会产生对外可观测副作用（如 MARKER 追加），
+  恢复后这些步骤直接跳过，副作用不会重复。
+
+### 4.2 关停打断 ≠ 人工取消
+
+| | 关停打断 | 人工取消 |
+|---|---|---|
+| 触发 | 进程优雅关停中断工作线程 | `POST /api/tasks/{id}/cancel` 置 `cancelRequested` |
+| 落库结论 | 保持非终结状态（`RUNNING`/`RETRY_WAIT`/`QUEUED`），不写终态 | 收束为 `CANCELLED` 终态，未成功步骤置 `CANCELLED` |
+| 重启后 | 恢复器重新排队，按原安排继续推进 | 终态不被触碰，绝不复活 |
+| 审计 | `RECOVERY_RESUMED`（from=关停时状态） | `TASK_CANCELLED`（执行期 stage=execution；恢复器收尾 stage=recovery） |
+
+**关停与取消几乎同时发生时，结论唯一、可判定**：以存储中的 `cancelRequested`
+标志为唯一判定依据，取消优先。判定与写回在存储锁内原子完成
+（`TaskStore.update`），因此：
+
+- 取消标志先落库 → 工作线程/恢复器观察到标志，收尾为 `CANCELLED`；
+- 关停先把工作线程打断 → 打断路径不写库，取消请求随后正常落库，
+  恢复器启动时把带标志的任务收尾为 `CANCELLED`；
+- 不存在“先被记成已结束、重启后又被接着执行”的顺序：打断路径不产生任何终态写，
+  恢复器对终态任务一律不触碰。
+
+### 4.3 持久化与幂等边界
 
 - 持久化：`tasks/<task-id>.json`（原子写）+ `audit.jsonl`（只追加）+
   `recurrence.json`（复发事件与确认/放弃标记，原子写），
@@ -155,7 +192,8 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
 - 优雅关停时中断工作线程：任务保持非终结状态落库，下次启动按上表恢复；
   不会在关停路径写入任何虚假终态。
 - 幂等边界：步骤在 SUCCEEDED 之后才产生对外可观测副作用（如 MARKER 追加成功），
-  崩溃的当前步骤整体重跑；`RecoveryTest` 用 marker 文件行数证明已完成步骤不重复。
+  崩溃的当前步骤整体重跑；`RecoveryTest` 与 `ShutdownRecoveryTest` 用 marker 文件行数
+  证明已完成步骤不重复。
 
 ---
 
@@ -251,7 +289,7 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
 
 无需任何外部服务或凭据，JDK 21+ 与 Maven 即可。
 
-### 8.1 运行全部测试（32 个用例）
+### 8.1 运行全部测试（35 个用例）
 
 ```bash
 mvn test
@@ -269,6 +307,7 @@ mvn test
 | 运行中/排队中取消，无半完成状态 | `CancelRunningTest` |
 | 重试上限与退避、恒失败终态、步骤超时中断 | `RetryAndFailureTest` |
 | 重启恢复、已完成步骤不重跑、停机期间审批超时 | `RecoveryTest` |
+| 关停落在退避等待/排队期间：不写终态、重启续跑、取消优先 | `ShutdownRecoveryTest` |
 | 复发抑制/受控重开、窗口边界、升级与确认、放弃、重启后复发连续性 | `RecurrenceTest` |
 | HTTP 全链路（受理→去重→审批→成功→审计；窗口抑制） | `EndToEndIntegrationTest` |
 
@@ -276,7 +315,29 @@ mvn test
 `[accept] input ...`、`[match] ... basis: ...`、`[run] task=... step=... attempt=...`、
 `[recovery] ... completed steps preserved: ...`。
 
-### 8.2 启动应用并手工验证
+### 8.2 复现“关停落在等待重试期间”的场景
+
+`ShutdownRecoveryTest` 在本地真实复现该场景（真实文件存储 + 真实调度线程）：
+
+```bash
+mvn test -Dtest=ShutdownRecoveryTest
+```
+
+关键用例 `shutdownDuringBackoffKeepsTaskUnfinishedAndResumesAfterRestart` 的流程：
+
+1. 策略为 `MARKER(必成功) → FLAKY(第 1 次失败)`，退避基数 30s，真实调度跑起来；
+2. step0 成功、step1 第一次失败后任务进入 `RETRY_WAIT`（日志可见
+   `关停前关键状态: state=RETRY_WAIT ... steps=[0:SUCCEEDED(attempts=1), 1:PENDING(attempts=1)]`）；
+3. 退避等待期间调用 `dispatcher.stop()` 优雅关停，断言任务**仍是 `RETRY_WAIT` 非终态**、
+   审计中无 `TASK_CANCELLED`；
+4. 在同一数据目录上重新初始化存储与调度器（模拟重启），断言任务被恢复重排并推进到
+   `SUCCEEDED`：step0 的 `attempts` 仍为 1 且 marker 行数为 1（副作用不重复），
+   step1 的 `attempts` 累计为 2（尝试次数不清零）。
+
+同类的 `queuedTaskSurvivesShutdownAndRunsAfterRestart` 覆盖“排队期间关停”，
+`pendingCancelAtShutdownIsFinalizedOnRecovery` 覆盖“关停与取消同时发生时取消优先”。
+
+### 8.3 启动应用并手工验证
 
 ```bash
 mvn spring-boot:run

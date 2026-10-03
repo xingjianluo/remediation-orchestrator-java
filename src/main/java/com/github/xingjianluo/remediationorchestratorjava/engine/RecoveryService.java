@@ -24,6 +24,8 @@ import java.util.Map;
  *   <li>RETRY_WAIT：直接重新排队，重试计数 attempts 已持久化，退避重新计算；</li>
  *   <li>QUEUED：保持排队；</li>
  *   <li>WAITING_APPROVAL：审批结论是外部决策，继续等待；若截止时间已过则置 APPROVAL_TIMEOUT；</li>
+ *   <li>带 cancelRequested 的非终结任务：关停前已收到主动取消、但工作线程没来得及收尾，
+ *       取消优先于恢复，直接收尾为 CANCELLED（保证“关停与取消同时发生”时结论唯一）；</li>
  *   <li>终态任务一律不触碰。</li>
  * </ul>
  */
@@ -48,8 +50,33 @@ public class RecoveryService {
         int resumed = 0;
         int resumedSteps = 0;
         int timedOutApprovals = 0;
+        int finalizedCancels = 0;
         for (RemediationTask task : open) {
             TaskState before = task.state;
+            if (task.cancelRequested) {
+                // 关停前已收到主动取消但工作线程未及收尾：取消优先于恢复，收尾为 CANCELLED。
+                // 与 TaskDispatcher 的关停路径一致——cancelRequested 是取消/关停竞争的唯一判定依据。
+                for (var step : task.steps) {
+                    if (step.state != StepState.SUCCEEDED) {
+                        step.state = StepState.CANCELLED;
+                        step.updatedAt = now;
+                    }
+                }
+                task.state = TaskState.CANCELLED;
+                task.terminalReason = "cancel requested before shutdown; finalized during recovery";
+                task.finishedAt = now;
+                task.updatedAt = now;
+                taskStore.save(task);
+                auditLog.append(new AuditEvent(now, AuditEvents.TASK_CANCELLED, task.id,
+                        alertId(task), Map.of(
+                                "stage", "recovery",
+                                "stateAtShutdown", before.name(),
+                                "reason", task.terminalReason)));
+                finalizedCancels++;
+                log.info("[recovery] task={} had pending cancel at shutdown (was {}); finalized CANCELLED",
+                        task.id, before);
+                continue;
+            }
             switch (before) {
                 case RUNNING, RETRY_WAIT -> {
                     for (var step : task.steps) {
@@ -105,6 +132,7 @@ public class RecoveryService {
         summary.put("resumed", resumed);
         summary.put("resetRunningSteps", resumedSteps);
         summary.put("timedOutApprovals", timedOutApprovals);
+        summary.put("finalizedCancels", finalizedCancels);
         auditLog.append(new AuditEvent(now, AuditEvents.RECOVERY_SCAN, null, null, summary));
         log.info("[recovery] scan complete: {}", summary);
         return resumed;

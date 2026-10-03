@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.UnaryOperator;
 
 /** 进程内任务存储，供单元测试使用（不落盘）。同样返回深拷贝以模拟持久化语义。 */
 public class InMemoryTaskStore implements TaskStore {
@@ -21,6 +22,17 @@ public class InMemoryTaskStore implements TaskStore {
     public synchronized RemediationTask save(RemediationTask task) {
         tasks.put(task.id, copy(task));
         return task;
+    }
+
+    @Override
+    public synchronized Optional<RemediationTask> update(String taskId, UnaryOperator<RemediationTask> mutator) {
+        RemediationTask current = tasks.get(taskId);
+        if (current == null) {
+            return Optional.empty();
+        }
+        RemediationTask updated = mutator.apply(copy(current));
+        tasks.put(updated.id, copy(updated));
+        return Optional.of(copy(updated));
     }
 
     @Override
