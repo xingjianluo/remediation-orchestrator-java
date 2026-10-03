@@ -33,9 +33,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <ul>
  *   <li>全局并发：固定大小线程池 = maxConcurrent，拿不到槽位的任务保持 QUEUED，不丢弃；</li>
  *   <li>同目标串行：维护运行中目标集合，同一目标同时只有一个任务在线程中；</li>
- *   <li>重试退避：失败后持久化 RETRY_WAIT + nextAttemptAt，线程内退避等待（崩溃后由恢复器重排队）；</li>
+ *   <li>重试退避：失败后持久化 RETRY_WAIT + nextAttemptAt + 下次尝试序号，线程内退避等待（崩溃后由恢复器重排队）；</li>
  *   <li>取消：每个步骤与退避等待前后检查 cancelRequested，取消时未做步骤置 CANCELLED，不留半完成态；</li>
- *   <li>关停：工作线程被中断时保留 RUNNING 落库状态，下次启动恢复，不写任何终态。</li>
+ *   <li>关停：工作线程被中断时保留 RUNNING/RETRY_WAIT 落库状态，下次启动恢复，不写任何终态；
+ *       关停与主动取消同时发生时，以持久化的 cancelRequested 为准（取消优先，结论唯一）。</li>
  * </ul>
  */
 public class TaskDispatcher implements SmartLifecycle {
@@ -106,7 +107,24 @@ public class TaskDispatcher implements SmartLifecycle {
             lanePool.shutdownNow();
         }
         stepExecutor.shutdown();
+        // 优雅关停：等待工作线程把“被关停打断”的非终态落库后再返回，
+        // 保证 stop() 返回时持久化状态已确定（RETRY_WAIT/RUNNING 保持原样，绝不写终态）。
+        awaitTermination(lanePool, "lane-pool");
+        awaitTermination(scheduler, "scheduler");
         log.info("[dispatcher] stopped; interrupted tasks remain recoverable on next start");
+    }
+
+    private static void awaitTermination(ExecutorService pool, String name) {
+        if (pool == null) {
+            return;
+        }
+        try {
+            if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
+                log.warn("[dispatcher] {} did not terminate within 5s during shutdown", name);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override
@@ -200,9 +218,9 @@ public class TaskDispatcher implements SmartLifecycle {
                     finishCancel(taskId);
                     return;
                 }
-                if (outcome == StepOutcome.INTERRUPTED) {
+                if (outcome == StepOutcome.INTERRUPTED || outcome == StepOutcome.SHUTDOWN) {
                     interruptedByShutdown = true;
-                    return; // 保持 RUNNING 落库态，等待重启恢复
+                    return; // 保持 RUNNING/RETRY_WAIT 落库态，等待重启恢复
                 }
                 if (outcome == StepOutcome.FAILED) {
                     finishFailed(taskId);
@@ -216,7 +234,7 @@ public class TaskDispatcher implements SmartLifecycle {
             runningTargets.remove(extractTarget(taskId));
             active.decrementAndGet();
             if (interruptedByShutdown) {
-                log.info("[run] task={} left RUNNING for restart recovery", taskId);
+                log.info("[run] task={} left non-terminal for restart recovery", taskId);
             }
         }
     }
@@ -232,7 +250,9 @@ public class TaskDispatcher implements SmartLifecycle {
         long timeout = task.stepTimeoutMillis >= 0 ? task.stepTimeoutMillis
                 : props.getDefaultStepTimeoutMillis();
 
-        int attempt = 0; // 0 = 首次执行；1..maxRetries 为重试
+        // 起始尝试序号取自持久化的 nextAttempt：重启恢复后重试进度不清零；
+        // 被崩溃/关停打断的未完成尝试不推进 nextAttempt，恢复后原地重跑。
+        int attempt = Math.max(0, step.nextAttempt); // 0 = 首次执行；1..maxRetries 为重试
         while (attempt <= maxRetries) {
             RemediationTask fresh = taskStore.findById(task.id).orElseThrow();
             if (fresh.cancelRequested) {
@@ -294,6 +314,10 @@ public class TaskDispatcher implements SmartLifecycle {
                 step.state = StepState.PENDING;
                 task.updatedAt = clock.millis();
                 taskStore.save(task);
+                audit(task, AuditEvents.TASK_SHUTDOWN_INTERRUPTED, Map.of(
+                        "stage", "step-execution",
+                        "step", step.index,
+                        "persistedState", task.state.name()));
                 return StepOutcome.INTERRUPTED;
             }
 
@@ -304,6 +328,7 @@ public class TaskDispatcher implements SmartLifecycle {
             if (attempt < maxRetries) {
                 long delay = backoffBase * (attempt + 1);
                 step.state = StepState.PENDING;
+                step.nextAttempt = attempt + 1; // 持久化重试进度：重启后从这里继续，不清零
                 task.state = TaskState.RETRY_WAIT;
                 task.nextAttemptAt = clock.millis() + delay;
                 task.updatedAt = clock.millis();
@@ -314,8 +339,22 @@ public class TaskDispatcher implements SmartLifecycle {
                         "backoffMillis", delay,
                         "nextAttemptAt", task.nextAttemptAt));
                 log.info("[run] task={} step={} retry {} in {}ms", task.id, step.index, attempt + 2, delay);
-                if (sleepBackoff(task.id, delay)) {
+                BackoffOutcome backoff = sleepBackoff(task.id, delay);
+                if (backoff == BackoffOutcome.CANCELLED) {
                     return StepOutcome.CANCELLED;
+                }
+                if (backoff == BackoffOutcome.SHUTDOWN) {
+                    // 关停打断退避等待：RETRY_WAIT + nextAttemptAt 已落库，保持原样等重启恢复，
+                    // 绝不在这里写 CANCELLED/FAILED 等终态（关停 ≠ 主动取消）。
+                    RemediationTask persisted = taskStore.findById(task.id).orElseThrow();
+                    audit(persisted, AuditEvents.TASK_SHUTDOWN_INTERRUPTED, Map.of(
+                            "stage", "backoff-wait",
+                            "step", step.index,
+                            "persistedState", persisted.state.name(),
+                            "nextAttemptAt", persisted.nextAttemptAt));
+                    log.info("[run] task={} shutdown during backoff; stays {} until restart",
+                            task.id, persisted.state);
+                    return StepOutcome.SHUTDOWN;
                 }
                 task.state = TaskState.RUNNING;
                 task.nextAttemptAt = 0;
@@ -335,27 +374,39 @@ public class TaskDispatcher implements SmartLifecycle {
     /**
      * 退避等待。注意：线程睡眠基于真实墙钟时间，因此循环截止判定使用 System.currentTimeMillis()；
      * 持久化字段 nextAttemptAt 仍使用注入时钟，以保证重启恢复语义可测。
-     *
-     * @return true 表示退避期间收到取消请求或关停中断。
+     * <p>
+     * 关停与主动取消的区分规则（结论唯一）：被打断时回读持久化状态，
+     * {@code cancelRequested=true} → CANCELLED（取消优先）；否则 → SHUTDOWN（保持非终态等恢复）。
      */
-    private boolean sleepBackoff(String taskId, long delayMillis) {
+    private BackoffOutcome sleepBackoff(String taskId, long delayMillis) {
         long deadline = System.currentTimeMillis() + delayMillis;
         while (true) {
             long remaining = deadline - System.currentTimeMillis();
             if (remaining <= 0) {
-                return false;
+                return BackoffOutcome.COMPLETED;
             }
             try {
                 Thread.sleep(Math.min(50, remaining));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return true;
+                // 被中断只可能是关停或取消：以持久化的 cancelRequested 为唯一判定依据
+                return isCancelRequested(taskId) ? BackoffOutcome.CANCELLED : BackoffOutcome.SHUTDOWN;
             }
             RemediationTask latest = taskStore.findById(taskId).orElse(null);
-            if (latest == null || latest.cancelRequested || !running) {
-                return true;
+            if (latest == null) {
+                return BackoffOutcome.CANCELLED; // 任务已消失，停止等待（收尾方会按找不到任务处理）
+            }
+            if (latest.cancelRequested) {
+                return BackoffOutcome.CANCELLED;
+            }
+            if (!running) {
+                return BackoffOutcome.SHUTDOWN;
             }
         }
+    }
+
+    private boolean isCancelRequested(String taskId) {
+        return taskStore.findById(taskId).map(t -> t.cancelRequested).orElse(true);
     }
 
     private void finishSucceeded(String taskId) {
@@ -418,6 +469,10 @@ public class TaskDispatcher implements SmartLifecycle {
     }
 
     private enum StepOutcome {
-        SUCCEEDED, FAILED, CANCELLED, INTERRUPTED
+        SUCCEEDED, FAILED, CANCELLED, INTERRUPTED, SHUTDOWN
+    }
+
+    private enum BackoffOutcome {
+        COMPLETED, CANCELLED, SHUTDOWN
     }
 }

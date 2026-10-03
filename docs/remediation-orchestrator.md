@@ -144,7 +144,7 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
 |---|---|
 | `QUEUED` | 继续排队 |
 | `RUNNING` | 崩溃时在跑的步骤若处于 RUNNING 则重置为 PENDING，任务回到 QUEUED；**已经 SUCCEEDED 的步骤原样保留，绝不重新执行** |
-| `RETRY_WAIT` | 回到 QUEUED（退避重新计时），已持久化的 attempts 不丢 |
+| `RETRY_WAIT` | 回到 QUEUED 等待再次调度；已持久化的 `attempts` 与下次尝试序号 `nextAttempt` 不丢，**重试进度不清零**，恢复后从断点继续消耗剩余重试额度 |
 | `WAITING_APPROVAL` | 审批是外部决策，继续等待；若截止时间已过则落 `APPROVAL_TIMEOUT` |
 | 任何终态 | 完全不触碰 |
 
@@ -156,6 +156,28 @@ TaskDispatcher（定时扫描 + 固定大小线程池）
   不会在关停路径写入任何虚假终态。
 - 幂等边界：步骤在 SUCCEEDED 之后才产生对外可观测副作用（如 MARKER 追加成功），
   崩溃的当前步骤整体重跑；`RecoveryTest` 用 marker 文件行数证明已完成步骤不重复。
+
+### 4.1 关停恰好落在等待重试或排队期间
+
+优雅关停（Spring 关闭上下文 → `TaskDispatcher.stop()`，**不是 `kill -9`**）可能正好打断
+一个没在跑步骤、而是在**退避等待重试**（`RETRY_WAIT`）或**排队等槽位**（`QUEUED`）的修复。
+此时的语义：
+
+- **关停打断 ≠ 主动取消**。退避等待被打断时，工作线程把 `RETRY_WAIT + nextAttemptAt`
+  原样留在库里并追加 `TASK_SHUTDOWN_INTERRUPTED` 审计（区分于 `TASK_CANCELLED`），
+  绝不写 `CANCELLED`/`FAILED` 等终态；`QUEUED` 任务本就落库，关停完全不触碰。
+- `stop()` 会等待工作线程把上述状态落库后再返回，因此 `stop()` 返回时持久化结论已确定。
+- 重启后恢复扫描把 `RETRY_WAIT` 校正为 `QUEUED` 重新纳入调度：
+  该重试的继续重试（`nextAttempt` 已持久化，重试次数不重新计数）、该排队的继续排队，
+  最终正常走到 `SUCCEEDED`/`FAILED`；已 `SUCCEEDED` 的步骤不会重跑、副作用不重复。
+- **关停与主动取消几乎同时发生时，结论唯一**：以持久化的 `cancelRequested` 标志为唯一判定依据
+  ——取消优先。只要取消请求已落库，无论关停是否同时发生，任务都收束为 `CANCELLED` 终态，
+  恢复扫描对终态任务完全不触碰，不会出现“先记已结束、重启后又被接着执行”的自相矛盾。
+- 因为 `RETRY_WAIT`/`QUEUED` 都是非终态，等待重试或排队中的修复在复发/去重判定里
+  始终被当作“未结束”：等价告警按 `DUPLICATE` 合并，而不会误入复发路径
+  （`RECURRENCE_*`），重启恢复后亦然。
+
+本地复现与验证见 8.1 节 `ShutdownDuringRetryWaitTest`。
 
 ---
 
@@ -269,12 +291,34 @@ mvn test
 | 运行中/排队中取消，无半完成状态 | `CancelRunningTest` |
 | 重试上限与退避、恒失败终态、步骤超时中断 | `RetryAndFailureTest` |
 | 重启恢复、已完成步骤不重跑、停机期间审批超时 | `RecoveryTest` |
+| 关停落在退避等待/排队期间：非终态落库、重启续跑、重试进度不清零、副作用不重复、取消优先于关停 | `ShutdownDuringRetryWaitTest` |
 | 复发抑制/受控重开、窗口边界、升级与确认、放弃、重启后复发连续性 | `RecurrenceTest` |
 | HTTP 全链路（受理→去重→审批→成功→审计；窗口抑制） | `EndToEndIntegrationTest` |
 
 单测日志会打印**输入、判定依据与关键状态迁移**，例如
 `[accept] input ...`、`[match] ... basis: ...`、`[run] task=... step=... attempt=...`、
 `[recovery] ... completed steps preserved: ...`。
+
+### 8.1.1 本地复现“关停落在等待重试/排队期间”
+
+```bash
+mvn test -Dtest=ShutdownDuringRetryWaitTest
+```
+
+该用例使用真实调度器 + 真实文件存储，完整走一遍“关停—重启—恢复”：
+
+1. **进程 1**：任务 A（`MARKER` + `FLAKY failFirst=1`，退避 500ms）真实跑起来，
+   第一步成功、第二步第一次失败进入 `RETRY_WAIT`；并发上限 1，任务 B 同时在 `QUEUED` 排队。
+   此时推送等价告警可观察到 `DUPLICATE`（等待重试的修复被当作未结束）。
+2. **优雅关停**：`dispatcher.stop()` 返回后断言 A 仍是 `RETRY_WAIT`、B 仍是 `QUEUED`，
+   审计中有 `TASK_SHUTDOWN_INTERRUPTED` 且没有任何 `TASK_CANCELLED`。
+3. **进程 2**：同一数据目录重建全套组件并启动，恢复扫描把 A 校正为 `QUEUED`，
+   断言 A 最终 `SUCCEEDED`、第二步 `attempts=2`（关停前 1 次 + 恢复后补 1 次，进度不清零）、
+   第一步的 MARKER 副作用只有一行（已成功步骤不重跑），B 也正常跑完。
+
+同类的第二个用例 `cancelRacingShutdownResolvesToSingleCancelledOutcome` 验证：
+退避等待期间“主动取消 + 关停”同时发生时，任务唯一收束为 `CANCELLED`，
+重启后终态不被复活。
 
 ### 8.2 启动应用并手工验证
 

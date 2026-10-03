@@ -16,6 +16,8 @@ public final class AuditEvents {
     public static final String APPROVAL_REJECTED = "APPROVAL_REJECTED";
     public static final String APPROVAL_TIMEOUT = "APPROVAL_TIMEOUT";
     public static final String TASK_CANCELLED = "TASK_CANCELLED";
+    /** 优雅关停打断了执行/退避等待：任务保持非终态落库，等待重启恢复；与主动取消严格区分。 */
+    public static final String TASK_SHUTDOWN_INTERRUPTED = "TASK_SHUTDOWN_INTERRUPTED";
     public static final String STEP_STARTED = "STEP_STARTED";
     public static final String STEP_SUCCEEDED = "STEP_SUCCEEDED";
     public static final String STEP_FAILED = "STEP_FAILED";
